@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -131,9 +132,63 @@ def _status_text(cfg: dict) -> str:
     )
 
 
+def _show_prices(args: list[str], overrides: dict, cfg: dict) -> str:
+    """예산 이내로 트래킹 중인 항공권을 전부 보여준다.
+
+    track_prices.py가 기록한 가격 이력 DB(state/flight_prices.sqlite)에서
+    (목적지 × 출발일)별 사상 최저가와 가장 최근 조회가를 읽어, 현재 예산 이하인
+    것만 싼 순서로 나열한다. DB는 track_prices.py 소유라 여기서는 mode=ro로만
+    연다 — 두 워크플로가 같은 파일을 쓰지 않게 한 설계를 깨지 않기 위해서다.
+    """
+    budget = cfg["budget_krw"]
+    db_path = HERE / cfg["state_db"]
+    try:
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return "아직 가격 이력이 없습니다. track_prices 첫 조회가 끝나면 다시 시도하세요."
+
+    try:
+        rows = conn.execute(
+            "SELECT destination, depart_date, best_price_krw "
+            "FROM best WHERE best_price_krw <= ? ORDER BY best_price_krw",
+            (budget,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return "아직 가격 이력이 없습니다. track_prices 첫 조회가 끝나면 다시 시도하세요."
+
+    if not rows:
+        conn.close()
+        return (
+            f"💰 예산 ₩{budget:,} 이내 항공권: 아직 없음\n"
+            "다음 조회에서 예산 이하가 나오면 알림이 갑니다."
+        )
+
+    q2disp = {d["query"]: d["display"] for d in cfg["destinations"]}
+    lines = [f"💰 예산 ₩{budget:,} 이내 항공권 ({len(rows)}건)", "─" * 20]
+    for dest, dep, best_price in rows:
+        disp = q2disp.get(dest, dest)
+        latest = conn.execute(
+            "SELECT price_krw, checked_at FROM checks "
+            "WHERE destination=? AND depart_date=? ORDER BY checked_at DESC LIMIT 1",
+            (dest, dep),
+        ).fetchone()
+        if latest and latest[0] != best_price:
+            day = latest[1][5:10].replace("-", "/")
+            tail = f" · 최근 ₩{latest[0]:,} ({day})"
+        else:
+            tail = ""
+        lines.append(f"{disp} {dep[5:]} · 최저 ₩{best_price:,}{tail}")
+    conn.close()
+    lines.append("")
+    lines.append("가격 = 트래킹 이래 최저가. 항공편 상세는 알림 메시지에서 확인.")
+    return "\n".join(lines)
+
+
 HELP_TEXT = (
     "✈️ flight_watch 명령어\n"
     "/status — 현재 설정 보기\n"
+    "/price — 예산 이내로 트래킹 중인 항공권 전부 보기\n"
     "/budget 400000 — 예산(원) 변경\n"
     "/dates 2026-09-30 2026-10-01 2026-10-07 — 출발일(들) + 마지막 값은 귀국일\n"
     "/minhour 2026-09-30 17 — 그 출발일은 17시 이후 항공편만 (0 또는 none이면 해제)\n"
@@ -244,6 +299,8 @@ def handle_message(text: str, overrides: dict, cfg: dict) -> str | None:
         return HELP_TEXT
     if cmd == "status":
         return _status_text(cfg)
+    if cmd == "price":
+        return _show_prices(args, overrides, cfg)
     if cmd in COMMANDS:
         return COMMANDS[cmd](args, overrides, cfg)
     return f"모르는 명령어입니다: /{cmd}\n\n{HELP_TEXT}"
