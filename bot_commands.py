@@ -248,7 +248,7 @@ def main() -> None:
 
     overrides = load_overrides()
     notifier = TelegramNotifier(token=token, chat_id=chat_id)
-    replied = False
+    reply_count = 0
 
     for msg in messages:
         text = msg.get("text", "")
@@ -257,11 +257,11 @@ def main() -> None:
         reply = handle_message(text, overrides, cfg)
         if reply:
             notifier.send_message(reply, parse_mode="")
-            replied = True
+            reply_count += 1
 
     save_overrides(overrides)
     _save_offset(next_offset)
-    print(f"처리한 메시지 {len(messages)}건, 응답 {int(replied)}건, 다음 offset={next_offset}")
+    print(f"처리한 메시지 {len(messages)}건, 응답 {reply_count}건, 다음 offset={next_offset}")
 
 
 if __name__ == "__main__":
