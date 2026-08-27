@@ -22,9 +22,15 @@ return_date: "2026-10-07"
 # 예산(원). 이 가격 이하로 떨어지면 알림.
 budget_krw: 500000
 
-# 검색 대상 도시 (중국 국내, 대련 출발 기준). Google Flights 검색어에
-# 그대로 들어가므로 영문 도시명을 쓴다. display는 텔레그램 메시지용 한글 표기.
+# 검색 대상 도시. Google Flights 검색어에 그대로 들어가므로 영문 도시명을
+# 쓴다. display는 텔레그램 메시지용 한글 표기.
+# 원래는 중국 국내로만 한정했다가, 예산만 맞으면 어디든 상관없다는 원래
+# 취지에 맞춰 일본·대만·홍콩·마카오·동남아까지 넓혔다 (한국은 출발지 기준
+# 여행지로서 의미가 없어 제외). Google Flights는 "어디든" 같은 자연어나
+# /travel/flights/explore 지도 검색은 날짜를 무시해버려 자동화가 안 되므로,
+# 후보 도시를 정해두고 하나씩 정확한 날짜로 조회하는 지금 방식을 유지한다.
 destinations:
+  # 중국 국내
   - {query: "Sanya",        display: "싼야(하이난)"}
   - {query: "Kunming",      display: "쿤밍"}
   - {query: "Lijiang",      display: "리장"}
@@ -40,6 +46,26 @@ destinations:
   - {query: "Shenzhen",     display: "선전"}
   - {query: "Changsha",     display: "창사"}
   - {query: "Guiyang",      display: "구이양"}
+  # 일본
+  - {query: "Tokyo",        display: "도쿄"}
+  - {query: "Osaka",        display: "오사카"}
+  - {query: "Fukuoka",      display: "후쿠오카"}
+  - {query: "Sapporo",      display: "삿포로"}
+  # 대만 · 홍콩 · 마카오
+  - {query: "Taipei",       display: "타이베이"}
+  - {query: "Hong Kong",    display: "홍콩"}
+  - {query: "Macau",        display: "마카오"}
+  # 동남아
+  - {query: "Bangkok",         display: "방콕"}
+  - {query: "Ho Chi Minh City", display: "호치민"}
+  - {query: "Hanoi",           display: "하노이"}
+  - {query: "Da Nang",         display: "다낭"}
+  - {query: "Manila",          display: "마닐라"}
+  - {query: "Cebu",            display: "세부"}
+  - {query: "Singapore",       display: "싱가포르"}
+  - {query: "Kuala Lumpur",    display: "쿠알라룸푸르"}
+  - {query: "Phnom Penh",      display: "프놈펜"}
+  - {query: "Bali",            display: "발리"}
 
 # 목적지 사이 요청 간 딜레이(초). 너무 빠르게 연달아 조회하지 않도록 배려.
 request_delay_seconds: 4

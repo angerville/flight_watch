@@ -49,6 +49,17 @@ CITY_CATALOG: dict[str, str] = {
     "난창": "Nanchang", "우한": "Wuhan", "정저우": "Zhengzhou", "하얼빈": "Harbin",
     "창춘": "Changchun", "선양": "Shenyang", "베이징": "Beijing", "톈진": "Tianjin",
     "스자좡": "Shijiazhuang",
+    # 일본 / 대만 / 홍콩·마카오 / 동남아 (한국은 출발지 기준 여행지로 의미 없어 제외)
+    "도쿄": "Tokyo", "오사카": "Osaka", "후쿠오카": "Fukuoka", "삿포로": "Sapporo",
+    "나고야": "Nagoya", "오키나와": "Okinawa",
+    "타이베이": "Taipei", "가오슝": "Kaohsiung",
+    "홍콩": "Hong Kong", "마카오": "Macau",
+    "방콕": "Bangkok", "치앙마이": "Chiang Mai", "푸켓": "Phuket",
+    "호치민": "Ho Chi Minh City", "하노이": "Hanoi", "다낭": "Da Nang",
+    "마닐라": "Manila", "세부": "Cebu", "보라카이": "Boracay",
+    "싱가포르": "Singapore", "쿠알라룸푸르": "Kuala Lumpur",
+    "프놈펜": "Phnom Penh", "시엠립": "Siem Reap",
+    "발리": "Bali", "자카르타": "Jakarta",
 }
 
 
