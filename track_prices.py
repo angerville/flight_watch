@@ -308,7 +308,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
+    try:
+        # 로컬 실행 시 .env를 자동으로 읽어 환경변수로 반영한다. GitHub Actions
+        # 등 이미 환경변수가 주입된 곳에서는 .env도 dotenv 패키지도 없어도 되게
+        # 조용히 넘어간다.
+        from dotenv import load_dotenv
 
-    load_dotenv(ROOT / ".env")
+        load_dotenv(ROOT / ".env")
+    except ImportError:
+        pass
+
     main()
