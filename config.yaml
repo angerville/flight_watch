@@ -1,0 +1,50 @@
+# =============================================================================
+# 대련(DLC) 출발 국경절 항공권 가격 트래커 설정
+# =============================================================================
+# Ctrip/Trip.com은 자동화 접근을 자체 WAF("whaleguard")로 즉시 차단하므로
+# (요청 시점에 상태코드 432 확인) 데이터 소스는 Google Flights만 쓴다.
+# Google Flights는 봇 차단 없이 정상 응답하며, 통화를 KRW로 고정해 예산과
+# 바로 비교할 수 있다.
+
+origin: "Dalian"       # Google Flights 검색어에 들어가는 출발지 표기
+
+# 왕복 후보 날짜: 출발일 각각에 대해 귀국일 고정으로 검사한다.
+# min_departure_hour: 이 시각(24시간제, 이상) 이후 출발편만 인정. 제약 없으면 null.
+#   9/30은 그날 일정상 17시 이후 출발편만 탈 수 있어서 그 전 시간대 항공편은
+#   가격이 아무리 싸도 후보에서 제외한다.
+depart_dates:
+  - date: "2026-09-30"
+    min_departure_hour: 17
+  - date: "2026-10-01"
+    min_departure_hour: null
+return_date: "2026-10-07"
+
+# 예산(원). 이 가격 이하로 떨어지면 알림.
+budget_krw: 500000
+
+# 검색 대상 도시 (중국 국내, 대련 출발 기준). Google Flights 검색어에
+# 그대로 들어가므로 영문 도시명을 쓴다. display는 텔레그램 메시지용 한글 표기.
+destinations:
+  - {query: "Sanya",        display: "싼야(하이난)"}
+  - {query: "Kunming",      display: "쿤밍"}
+  - {query: "Lijiang",      display: "리장"}
+  - {query: "Xiamen",       display: "샤먼"}
+  - {query: "Guilin",       display: "구이린"}
+  - {query: "Zhangjiajie",  display: "장자제"}
+  - {query: "Chengdu",      display: "청두"}
+  - {query: "Chongqing",    display: "충칭"}
+  - {query: "Xian",         display: "시안"}
+  - {query: "Qingdao",      display: "칭다오"}
+  - {query: "Shanghai",     display: "상하이"}
+  - {query: "Guangzhou",    display: "광저우"}
+  - {query: "Shenzhen",     display: "선전"}
+  - {query: "Changsha",     display: "창사"}
+  - {query: "Guiyang",      display: "구이양"}
+
+# 목적지 사이 요청 간 딜레이(초). 너무 빠르게 연달아 조회하지 않도록 배려.
+request_delay_seconds: 4
+
+# 페이지 로드 후 결과 렌더링을 기다리는 시간(ms)
+render_wait_ms: 9000
+
+state_db: "state/flight_prices.sqlite"

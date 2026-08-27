@@ -1,0 +1,5 @@
+# track_prices.py 전용 (본 저장소 루트 requirements.txt는 공모전 파이프라인용이라
+# anthropic/pdfplumber 등 무거운 의존성이 섞여 있어 여기선 최소 구성만 별도로 둔다)
+PyYAML>=6.0.1
+requests>=2.31.0
+playwright>=1.62.0
