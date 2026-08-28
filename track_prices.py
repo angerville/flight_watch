@@ -51,6 +51,11 @@ log = logging.getLogger(__name__)
 #: 사상 최저가가 아니어도, 직전 최저가 대비 이만큼(비율) 이상 떨어지면 알림
 NOTABLE_DROP_PCT = 0.10
 
+#: 상한가(config의 max_price_krw)를 넘는 노선은 평소 관심 밖이라 현황 요약과
+#: "최저가 갱신" 알림에서 빼지만, 직전 최저가 대비 이 비율 이상 급락하면
+#: "진짜 특가"로 보고 상한가 위여도 그때는 알린다.
+SPECIAL_DEAL_DROP_PCT = 0.25
+
 #: 브라우저 실행 재시도 횟수. Task Scheduler로 돌리면 가끔 Playwright가
 #: "Executable doesn't exist"로 죽는다 (chrome-headless-shell.exe 파일이
 #: 실제로는 디스크에 그대로 있는데도). 원인이 무엇이든 - 브라우저가 지워졌든,
@@ -58,6 +63,25 @@ NOTABLE_DROP_PCT = 0.10
 #: 실패하면 브라우저를 자동으로 재설치하고 다시 시도한다.
 BROWSER_LAUNCH_ATTEMPTS = 3
 BROWSER_LAUNCH_RETRY_DELAY_SECONDS = 5
+
+#: 헤드리스 크로뮴 안정화 옵션.
+#:
+#: 조회 도중 "Page crashed"로 렌더러가 죽는 일이 잦았다. 한 번 죽으면 그 뒤
+#: 조회가 줄줄이 실패할 뿐 아니라, Playwright가 죽은 브라우저를 정리하면서
+#: 파이썬 프로세스까지 함께 끌려 죽어(작업 스케줄러 종료코드 0xC000013A)
+#: 그 시간대 알림이 통째로 사라졌다.
+#:
+#: /dev/shm 대신 임시 파일을 쓰게 하고(공유 메모리 부족으로 인한 렌더러
+#: 크래시 방지), 헤드리스에서 쓸모없는 GPU/확장/백그라운드 작업을 꺼서
+#: 크래시 요인 자체를 줄인다.
+BROWSER_LAUNCH_ARGS = [
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
+]
 
 
 def install_browser() -> None:
@@ -83,7 +107,7 @@ def launch_browser(p):
     last_err: Exception | None = None
     for attempt in range(1, BROWSER_LAUNCH_ATTEMPTS + 1):
         try:
-            return p.chromium.launch(headless=True)
+            return p.chromium.launch(headless=True, args=BROWSER_LAUNCH_ARGS)
         except Exception as e:  # noqa: BLE001 - 어떤 실패든 일단 복구를 시도한다
             last_err = e
             log.warning("브라우저 실행 실패 (시도 %d/%d): %s", attempt, BROWSER_LAUNCH_ATTEMPTS, e)
@@ -322,6 +346,7 @@ def build_digest(
     run_results: list[tuple[str, str, str, int]],
     budget_krw: int,
     top_n: int,
+    max_price_krw: int | None = None,
 ) -> str:
     """이번 조회 결과 현황 요약을 만든다 (가격 변동이 없어도 매번 보내는 용도).
 
@@ -345,12 +370,17 @@ def build_digest(
     rows.sort(key=lambda r: r[0])
     within = [r for r in rows if r[0] <= budget_krw]
 
+    # 상한가를 넘는 노선(리장·싼야처럼 늘 100만원대인 곳)은 요약에서 뺀다.
+    # 상한이 없거나 그 이하인 것만 남긴다.
+    shown = [r for r in rows if max_price_krw is None or r[0] <= max_price_krw]
+    hidden = len(rows) - len(shown)
+
     lines = [
         f"✈️ 항공권 현황 ({time.strftime('%m/%d %H:%M')})",
         f"예산 ₩{budget_krw:,} 이내: {len(within)}건 / 조회 {len(rows)}건",
         "─" * 20,
     ]
-    for price, display, dep_date, prev_price in rows[:top_n]:
+    for price, display, dep_date, prev_price in shown[:top_n]:
         if prev_price is None:
             delta = " (신규)"
         elif price > prev_price:
@@ -362,8 +392,10 @@ def build_digest(
         mark = "💰" if price <= budget_krw else "·"
         lines.append(f"{mark} {display} {dep_date[5:]} ₩{price:,}{delta}")
 
-    if len(rows) > top_n:
-        lines.append(f"…외 {len(rows) - top_n}건")
+    if len(shown) > top_n:
+        lines.append(f"…외 {len(shown) - top_n}건")
+    if hidden:
+        lines.append(f"(상한 ₩{max_price_krw:,} 초과 {hidden}건 숨김)")
     return "\n".join(lines)
 
 
@@ -375,6 +407,7 @@ def check_and_record(
     ret_date: str,
     result: FlightLeg,
     budget_krw: int,
+    max_price_krw: int | None = None,
 ) -> str | None:
     """이번 조회 결과를 기록하고, 알림이 필요하면 알림 문구(가는편만)를 돌려준다.
 
@@ -421,10 +454,16 @@ def check_and_record(
                 (result.price_krw, int(alerted or under_budget), destination, dep_date, ret_date),
             )
 
+            over_ceiling = max_price_krw is not None and result.price_krw > max_price_krw
+            special_deal = drop_pct >= SPECIAL_DEAL_DROP_PCT
+
             if newly_crossed_budget:
                 alert = f"💰 예산 이내로 진입 (이전 최저가 ₩{prev_best:,})\n{detail}"
-            elif notable:
+            elif notable and not over_ceiling:
                 alert = f"📉 최저가 갱신 (-{drop_pct:.0%}, 이전 ₩{prev_best:,})\n{detail}"
+            elif notable and over_ceiling and special_deal:
+                # 평소 상한가를 넘는 노선이라도 급락하면 "진짜 특가"로 보고 알린다.
+                alert = f"🔥 평소 비싼 노선 특가 (-{drop_pct:.0%}, 이전 ₩{prev_best:,})\n{detail}"
 
     conn.commit()
     return alert
@@ -485,7 +524,8 @@ def _run() -> None:
                         "%s (%s, %s 출발): ₩%s", dest["display"], dep_date, result.dep_display, f"{result.price_krw:,}"
                     )
                     alert = check_and_record(
-                        conn, dest["query"], dest["display"], dep_date, cfg["return_date"], result, cfg["budget_krw"]
+                        conn, dest["query"], dest["display"], dep_date, cfg["return_date"], result,
+                        cfg["budget_krw"], cfg.get("max_price_krw"),
                     )
                     run_results.append((dest["query"], dest["display"], dep_date, result.price_krw))
                     if alert:
@@ -510,7 +550,10 @@ def _run() -> None:
         messages.append(header + "\n\n".join(alerts))
     if cfg.get("hourly_digest"):
         messages.append(
-            build_digest(conn, run_results, cfg["budget_krw"], cfg.get("digest_top_n", 10))
+            build_digest(
+                conn, run_results, cfg["budget_krw"], cfg.get("digest_top_n", 10),
+                cfg.get("max_price_krw"),
+            )
         )
 
     if messages:

@@ -143,9 +143,12 @@ def _fmt_dates(cfg: dict) -> str:
 
 
 def _status_text(cfg: dict) -> str:
+    max_price = cfg.get("max_price_krw")
+    max_price_text = f"₩{max_price:,}" if max_price else "없음"
     return (
         "📋 현재 설정\n"
         f"예산: ₩{cfg['budget_krw']:,}\n"
+        f"상한가: {max_price_text}\n"
         f"날짜:\n{_fmt_dates(cfg)}\n"
         f"목적지({len(cfg['destinations'])}개): {_fmt_dest_list(cfg['destinations'])}"
     )
@@ -209,6 +212,7 @@ HELP_TEXT = (
     "/status — 현재 설정 보기\n"
     "/price — 예산 이내로 트래킹 중인 항공권 전부 보기\n"
     "/budget 400000 — 예산(원) 변경\n"
+    "/maxprice 800000 — 관심 상한가(원). 초과 목적지는 현황에서 뺌 (none이면 해제)\n"
     "/dates 2026-09-30 2026-10-01 2026-10-07 — 출발일(들) + 마지막 값은 귀국일\n"
     "/minhour 2026-09-30 17 — 그 출발일은 17시 이후 항공편만 (0 또는 none이면 해제)\n"
     "/destinations 상하이 시안 칭다오 — 목적지 목록 전체 교체 (카탈로그에 있는 이름만)\n"
@@ -225,6 +229,23 @@ def _apply_budget(args: list[str], overrides: dict, cfg: dict) -> str:
         return "예산은 숫자만 입력하세요. 예: /budget 400000"
     overrides["budget_krw"] = int(text)
     return f"✅ 예산을 ₩{int(text):,}로 변경했습니다."
+
+
+def _apply_maxprice(args: list[str], overrides: dict, cfg: dict) -> str:
+    if len(args) != 1:
+        return "사용법: /maxprice 800000  (해제하려면 /maxprice none)"
+    text = args[0].replace(",", "").lower()
+    if text in ("none", "off", "0"):
+        overrides["max_price_krw"] = None
+        return "✅ 상한가를 해제했습니다. 이제 모든 목적지가 현황에 나옵니다."
+    if not text.isdigit():
+        return "상한가는 숫자만 입력하세요. 예: /maxprice 800000"
+    overrides["max_price_krw"] = int(text)
+    return (
+        f"✅ 상한가를 ₩{int(text):,}로 설정했습니다.\n"
+        "이 값을 넘는 목적지는 현황·최저가 갱신 알림에서 빠집니다 "
+        "(25% 이상 급락 시엔 예외로 알림)."
+    )
 
 
 def _apply_dates(args: list[str], overrides: dict, cfg: dict) -> str:
@@ -297,6 +318,7 @@ def _apply_adddest(args: list[str], overrides: dict, cfg: dict) -> str:
 
 COMMANDS = {
     "budget": _apply_budget,
+    "maxprice": _apply_maxprice,
     "dates": _apply_dates,
     "minhour": _apply_minhour,
     "destinations": _apply_destinations,
