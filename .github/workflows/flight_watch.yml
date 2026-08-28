@@ -9,12 +9,24 @@ name: 대련 출발 국경절 항공권 가격 트래커
 # 그런 실패를 건너뛰고 다음 실행에서 재시도하도록 설계됨.
 on:
   schedule:
-    # 매시 13분. 정각(0분)은 전 세계 cron이 몰려 대기열 지연이 크므로 피함.
-    - cron: "13 * * * *"
+    # 6시간마다(00/06/12/18시 UTC) 13분에. 정각(0분)은 전 세계 cron이 몰려
+    # 대기열 지연이 크므로 피함.
+    #
+    # 원래 매시간이었는데 실제로는 하루 2~3번밖에 안 돌았다. 이 저장소가
+    # 비공개라 Actions 사용량이 무료 할당량(월 2,000분)에서 차감되는데,
+    # 1회 실행이 약 15분이라 매시간이면 월 10,000분이 넘어 한도를 7배
+    # 초과했기 때문. 분리 전 저장소에서 부담이 적은 주 1회 워크플로는 몇
+    # 주째 한 번도 안 빠지고 정확히 돌고 있어, 빈도가 원인임이 확인됐다.
+    #
+    # 평소 매시간 조회는 PC의 작업 스케줄러가 담당하고, 이 워크플로는 PC가
+    # 꺼져 있는 동안을 메우는 용도다 — 그래서 할당량에 확실히 들어오는
+    # 6시간 간격(월 약 1,800분)으로 낮췄다.
+    - cron: "13 0,6,12,18 * * *"
   workflow_dispatch: {}
 
+# 상태 DB를 더 이상 커밋하지 않으므로 읽기 권한이면 충분하다.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: flight-watch
@@ -47,22 +59,17 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: python track_prices.py
 
-      - name: 상태 DB 커밋
-        if: always()
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A state/
-          if git diff --staged --quiet; then
-            echo "상태 변경 없음 — 커밋 생략"
-            exit 0
-          fi
-          git commit -m "chore(flight-watch): 가격 이력 갱신 $(date -u '+%Y-%m-%d %H:%M UTC')"
-          for i in 1 2 3; do
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push && exit 0
-            echo "푸시 재시도 $i..."
-            sleep 5
-          done
-          echo "::error::상태 DB 푸시에 실패했습니다"
-          exit 1
+      # 상태 DB(state/flight_prices.sqlite)는 일부러 커밋하지 않는다.
+      #
+      # 예전에는 여기서 커밋·푸시했는데, 같은 sqlite를 이 워크플로와 PC의 작업
+      # 스케줄러가 각자 갱신하다 보니 내용이 갈라졌다. sqlite는 바이너리라
+      # 자동 병합이 안 돼서 매번 충돌했고, 실제로 한 번은 충돌을 한쪽으로
+      # 밀어버리면서 PC가 기록한 조회 이력 108건이 통째로 날아갔다.
+      #
+      # 그래서 가격 이력은 PC 쪽만 소유하도록 정리했다. 이 워크플로는 PC가
+      # 꺼져 있는 동안 조회해서 알림을 보내는 역할만 하고, 결과는 남기지
+      # 않는다 (커밋된 DB를 기준으로 비교만 한다).
+      #
+      # 부작용: PC가 오래 꺼져 있으면 기준 DB가 갱신되지 않아, 같은 가격
+      # 하락 알림이 실행 때마다 다시 갈 수 있다. 알림을 놓치는 것보다는
+      # 낫다고 보고 감수한다.
