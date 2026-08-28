@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -48,6 +49,48 @@ log = logging.getLogger(__name__)
 
 #: 사상 최저가가 아니어도, 직전 최저가 대비 이만큼(비율) 이상 떨어지면 알림
 NOTABLE_DROP_PCT = 0.10
+
+#: 브라우저 실행 재시도 횟수. Task Scheduler로 돌리면 가끔 Playwright가
+#: "Executable doesn't exist"로 죽는다 (chrome-headless-shell.exe 파일이
+#: 실제로는 디스크에 그대로 있는데도). 원인이 무엇이든 - 브라우저가 지워졌든,
+#: 일시적으로 접근이 막혔든 - 그 시간대 조회를 통째로 날리지 않도록,
+#: 실패하면 브라우저를 자동으로 재설치하고 다시 시도한다.
+BROWSER_LAUNCH_ATTEMPTS = 3
+BROWSER_LAUNCH_RETRY_DELAY_SECONDS = 5
+
+
+def install_browser() -> None:
+    """Playwright 브라우저(chromium)를 현재 파이썬 환경에 (재)설치한다."""
+    log.info("Playwright 브라우저를 설치합니다 (몇 분 걸릴 수 있음)...")
+    # encoding/errors를 명시하지 않으면 Windows 기본 코드페이지(cp949)로 디코딩하다
+    # playwright가 출력하는 UTF-8 박스 문자에서 UnicodeDecodeError가 난다.
+    proc = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode == 0:
+        log.info("Playwright 브라우저 설치 완료")
+    else:
+        log.warning("Playwright 브라우저 설치 실패 (코드 %d): %s", proc.returncode, proc.stderr.strip()[:500])
+
+
+def launch_browser(p):
+    """브라우저를 띄운다. 실패하면 재설치까지 시도한 뒤 재시도한다."""
+    last_err: Exception | None = None
+    for attempt in range(1, BROWSER_LAUNCH_ATTEMPTS + 1):
+        try:
+            return p.chromium.launch(headless=True)
+        except Exception as e:  # noqa: BLE001 - 어떤 실패든 일단 복구를 시도한다
+            last_err = e
+            log.warning("브라우저 실행 실패 (시도 %d/%d): %s", attempt, BROWSER_LAUNCH_ATTEMPTS, e)
+            if attempt < BROWSER_LAUNCH_ATTEMPTS:
+                install_browser()
+                time.sleep(BROWSER_LAUNCH_RETRY_DELAY_SECONDS)
+    assert last_err is not None
+    raise last_err
 
 
 @dataclass
@@ -216,6 +259,84 @@ def fetch_return_leg(page, outbound: FlightLeg, render_wait_ms: int) -> FlightLe
     return min(legs, key=lambda l: l.price_krw)
 
 
+def page_alive(page) -> bool:
+    """페이지(및 그 브라우저)가 아직 살아 있는지 확인한다."""
+    try:
+        page.evaluate("1")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def restart_browser(p, browser):
+    """죽은 브라우저를 정리하고 새로 띄운다. (browser, page)를 돌려준다."""
+    close_quietly(browser)
+    new_browser = launch_browser(p)
+    return new_browser, new_browser.new_page()
+
+
+def close_quietly(browser) -> None:
+    """브라우저를 닫되, 이미 죽어 있으면 조용히 넘어간다.
+
+    브라우저가 크래시한 상태에서 close()를 부르면 예외가 나는데, 그걸 그대로
+    두면 조회를 다 끝내고도 알림/현황을 못 보내고 죽는다 (실제로 그랬음).
+    """
+    try:
+        browser.close()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("브라우저 종료 중 오류(무시): %s", exc)
+
+
+def build_digest(
+    conn: sqlite3.Connection,
+    run_results: list[tuple[str, str, str, int]],
+    budget_krw: int,
+    top_n: int,
+) -> str:
+    """이번 조회 결과 현황 요약을 만든다 (가격 변동이 없어도 매번 보내는 용도).
+
+    직전 조회가와 비교한 등락(▲▼)을 같이 보여줘, 값이 그대로인지 움직이는
+    중인지 한눈에 알 수 있게 한다.
+    """
+    if not run_results:
+        return "✈️ 이번 조회에서 가격을 가져오지 못했습니다."
+
+    rows = []
+    for dest_query, display, dep_date, price in run_results:
+        prev = conn.execute(
+            "SELECT price_krw FROM checks WHERE destination=? AND depart_date=? "
+            "ORDER BY id DESC LIMIT 2",
+            (dest_query, dep_date),
+        ).fetchall()
+        # [0]은 방금 기록한 이번 조회가라 [1]이 직전 조회가.
+        prev_price = prev[1][0] if len(prev) > 1 else None
+        rows.append((price, display, dep_date, prev_price))
+
+    rows.sort(key=lambda r: r[0])
+    within = [r for r in rows if r[0] <= budget_krw]
+
+    lines = [
+        f"✈️ 항공권 현황 ({time.strftime('%m/%d %H:%M')})",
+        f"예산 ₩{budget_krw:,} 이내: {len(within)}건 / 조회 {len(rows)}건",
+        "─" * 20,
+    ]
+    for price, display, dep_date, prev_price in rows[:top_n]:
+        if prev_price is None:
+            delta = " (신규)"
+        elif price > prev_price:
+            delta = f" ▲{price - prev_price:,}"
+        elif price < prev_price:
+            delta = f" ▼{prev_price - price:,}"
+        else:
+            delta = " ="
+        mark = "💰" if price <= budget_krw else "·"
+        lines.append(f"{mark} {display} {dep_date[5:]} ₩{price:,}{delta}")
+
+    if len(rows) > top_n:
+        lines.append(f"…외 {len(rows) - top_n}건")
+    return "\n".join(lines)
+
+
 def check_and_record(
     conn: sqlite3.Connection,
     destination: str,
@@ -285,11 +406,12 @@ def main() -> None:
     conn = init_db(db_path)
 
     alerts: list[str] = []
+    run_results: list[tuple[str, str, str, int]] = []  # (query, display, 출발일, 가격)
     checked = 0
     skipped = 0
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = launch_browser(p)
         page = browser.new_page()
 
         for dest in cfg["destinations"]:
@@ -299,6 +421,15 @@ def main() -> None:
 
                 url = build_url(cfg["origin"], dest["query"], dep_date, cfg["return_date"])
                 legs = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
+
+                # 브라우저/페이지가 죽으면(메모리 부족 등으로 "Page crashed",
+                # "browser has been closed") 이후 모든 조회가 줄줄이 실패한다.
+                # 한 번 죽었다고 남은 목적지를 전부 날리지 않도록 되살린다.
+                if not legs and not page_alive(page):
+                    log.warning("브라우저가 죽어 재시작합니다")
+                    browser, page = restart_browser(p, browser)
+                    legs = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
+
                 result = pick_cheapest(legs, min_hour)
                 checked += 1
 
@@ -313,6 +444,7 @@ def main() -> None:
                     alert = check_and_record(
                         conn, dest["query"], dest["display"], dep_date, cfg["return_date"], result, cfg["budget_krw"]
                     )
+                    run_results.append((dest["query"], dest["display"], dep_date, result.price_krw))
                     if alert:
                         return_leg = fetch_return_leg(page, result, cfg["render_wait_ms"])
                         if return_leg:
@@ -323,11 +455,22 @@ def main() -> None:
 
                 time.sleep(cfg["request_delay_seconds"])
 
-        browser.close()
+        close_quietly(browser)
 
     log.info("완료: %d건 조회, %d건 실패, %d건 알림", checked, skipped, len(alerts))
 
+    # 보낼 메시지를 먼저 모은다. 알림(가격 급락/예산 진입)은 조건부지만,
+    # hourly_digest가 켜져 있으면 변동이 없어도 매 실행마다 현황을 보낸다.
+    messages: list[str] = []
     if alerts:
+        header = f"✈️ 대련 출발 국경절 항공권 알림 ({len(alerts)}건)\n{'─' * 20}\n"
+        messages.append(header + "\n\n".join(alerts))
+    if cfg.get("hourly_digest"):
+        messages.append(
+            build_digest(conn, run_results, cfg["budget_krw"], cfg.get("digest_top_n", 10))
+        )
+
+    if messages:
         import os
 
         # 공모전 파이프라인(contest_auto)이 쓰는 TELEGRAM_BOT_TOKEN과는 별도로,
@@ -339,8 +482,8 @@ def main() -> None:
             log.warning("FLIGHT_TELEGRAM_BOT_TOKEN/FLIGHT_TELEGRAM_CHAT_ID가 없어 알림을 보내지 못했습니다")
         else:
             notifier = TelegramNotifier(token=token, chat_id=chat_id)
-            header = f"✈️ 대련 출발 국경절 항공권 알림 ({len(alerts)}건)\n{'─' * 20}\n"
-            notifier.send_message(header + "\n\n".join(alerts), parse_mode="")
+            for msg in messages:
+                notifier.send_message(msg, parse_mode="")
 
     conn.close()
 
