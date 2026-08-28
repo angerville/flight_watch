@@ -259,6 +259,35 @@ def fetch_return_leg(page, outbound: FlightLeg, render_wait_ms: int) -> FlightLe
     return min(legs, key=lambda l: l.price_krw)
 
 
+#: 텔레그램 전송 재시도 간격(초). 조회를 13분이나 돌려놓고 마지막 전송 한 번이
+#: 실패했다고 결과를 통째로 버리면 안 된다 — 실제로 이 PC의 유선 연결이
+#: 간헐적으로 끊겨(DNS 조회 실패) 전체 실행이 통째로 날아간 적이 있다.
+#: 끊김이 대개 수십 초 안에 회복되므로 간격을 점점 늘려가며 다시 시도한다.
+SEND_RETRY_DELAYS_SECONDS = (5, 15, 45)
+
+
+def send_with_retry(notifier, text: str) -> bool:
+    """텔레그램으로 보내되, 일시적인 네트워크 오류면 몇 번 다시 시도한다.
+
+    끝내 실패하면 예외를 올리지 않고 내용을 로그에 남긴다 — 여기서 죽으면
+    이미 DB에 저장까지 끝낸 조회 결과가 로그에도 안 남아 통째로 사라진다.
+    """
+    for attempt in range(1, len(SEND_RETRY_DELAYS_SECONDS) + 2):
+        try:
+            notifier.send_message(text, parse_mode="")
+            if attempt > 1:
+                log.info("텔레그램 전송 성공 (시도 %d회째)", attempt)
+            return True
+        except Exception as exc:  # noqa: BLE001 - 어떤 실패든 재시도 대상
+            if attempt > len(SEND_RETRY_DELAYS_SECONDS):
+                log.error("텔레그램 전송 최종 실패: %s\n보내려던 내용:\n%s", exc, text)
+                return False
+            delay = SEND_RETRY_DELAYS_SECONDS[attempt - 1]
+            log.warning("텔레그램 전송 실패(%d회째), %d초 후 재시도: %s", attempt, delay, exc)
+            time.sleep(delay)
+    return False
+
+
 def page_alive(page) -> bool:
     """페이지(및 그 브라우저)가 아직 살아 있는지 확인한다."""
     try:
@@ -483,7 +512,7 @@ def main() -> None:
         else:
             notifier = TelegramNotifier(token=token, chat_id=chat_id)
             for msg in messages:
-                notifier.send_message(msg, parse_mode="")
+                send_with_retry(notifier, msg)
 
     conn.close()
 
