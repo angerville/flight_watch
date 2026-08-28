@@ -8,7 +8,9 @@ cd /d "%~dp0"
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 
-call "%~dp0..\_ensure_venv.bat"
+rem Task Scheduler captures no stdout/stderr by default, so log to a file
+rem too -- otherwise a failure via the scheduler is undiagnosable.
+call "%~dp0..\_ensure_venv.bat" >> "%~dp0task_run.log" 2>&1
 if errorlevel 1 goto :eof
 
-"%VENV_PY%" track_prices.py
+"%VENV_PY%" track_prices.py >> "%~dp0task_run.log" 2>&1
