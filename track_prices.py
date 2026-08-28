@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
@@ -55,6 +56,15 @@ NOTABLE_DROP_PCT = 0.10
 #: "최저가 갱신" 알림에서 빼지만, 직전 최저가 대비 이 비율 이상 급락하면
 #: "진짜 특가"로 보고 상한가 위여도 그때는 알린다.
 SPECIAL_DEAL_DROP_PCT = 0.25
+
+#: "평소보다 저렴" 특가 판정 — 사상 최저가를 새로 찍지 않아도, 현재가가 최근
+#: 이력의 중앙값보다 이 비율 이상 싸면 알린다 (값이 출렁이기만 하고 기록은
+#: 안 깨는 경우를 잡으려는 것). 상한가와 무관하게 모든 목적지에 적용.
+BELOW_TYPICAL_PCT = 0.15
+#: 중앙값을 낼 때 참고하는 "직전" 조회 건수(이번 조회는 제외).
+TYPICAL_LOOKBACK = 12
+#: 이력이 이만큼도 안 쌓였으면 "평소" 기준이 불안정하므로 판정하지 않는다.
+TYPICAL_MIN_SAMPLES = 6
 
 #: 브라우저 실행 재시도 횟수. Task Scheduler로 돌리면 가끔 Playwright가
 #: "Executable doesn't exist"로 죽는다 (chrome-headless-shell.exe 파일이
@@ -163,6 +173,12 @@ def init_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+
+    # 기존 DB에 없을 수 있는 컬럼은 여기서 채운다 (마이그레이션 도구가 따로 없어서).
+    best_cols = {r[1] for r in conn.execute("PRAGMA table_info(best)")}
+    if "alerted_below_typical" not in best_cols:
+        conn.execute("ALTER TABLE best ADD COLUMN alerted_below_typical INTEGER NOT NULL DEFAULT 0")
+
     conn.commit()
     return conn
 
@@ -422,7 +438,8 @@ def check_and_record(
     )
 
     row = conn.execute(
-        "SELECT best_price_krw, alerted_under_budget FROM best WHERE destination=? AND depart_date=? AND return_date=?",
+        "SELECT best_price_krw, alerted_under_budget, alerted_below_typical "
+        "FROM best WHERE destination=? AND depart_date=? AND return_date=?",
         (destination, dep_date, ret_date),
     ).fetchone()
 
@@ -442,19 +459,16 @@ def check_and_record(
         if under_budget:
             alert = f"🆕 예산 이내로 발견\n{detail}"
     else:
-        prev_best, alerted = row
-        if result.price_krw < prev_best:
-            drop_pct = (prev_best - result.price_krw) / prev_best
-            under_budget = result.price_krw <= budget_krw
+        prev_best, alerted, alerted_typ = row
+        now_price = result.price_krw
+        under_budget = now_price <= budget_krw
+        over_ceiling = max_price_krw is not None and now_price > max_price_krw
+
+        # (A) 사상 최저가 갱신 계열 알림
+        if now_price < prev_best:
+            drop_pct = (prev_best - now_price) / prev_best
             newly_crossed_budget = under_budget and not alerted
             notable = drop_pct >= NOTABLE_DROP_PCT
-
-            conn.execute(
-                "UPDATE best SET best_price_krw=?, alerted_under_budget=? WHERE destination=? AND depart_date=? AND return_date=?",
-                (result.price_krw, int(alerted or under_budget), destination, dep_date, ret_date),
-            )
-
-            over_ceiling = max_price_krw is not None and result.price_krw > max_price_krw
             special_deal = drop_pct >= SPECIAL_DEAL_DROP_PCT
 
             if newly_crossed_budget:
@@ -464,6 +478,38 @@ def check_and_record(
             elif notable and over_ceiling and special_deal:
                 # 평소 상한가를 넘는 노선이라도 급락하면 "진짜 특가"로 보고 알린다.
                 alert = f"🔥 평소 비싼 노선 특가 (-{drop_pct:.0%}, 이전 ₩{prev_best:,})\n{detail}"
+
+        # (B) 사상 최저가가 아니어도, 최근 조회가의 중앙값보다 확 싸면 특가로 본다.
+        #     (이번 조회는 방금 checks에 넣었으므로 OFFSET 1로 제외한다.)
+        recent = [
+            r[0]
+            for r in conn.execute(
+                "SELECT price_krw FROM checks "
+                "WHERE destination=? AND depart_date=? AND return_date=? AND price_krw IS NOT NULL "
+                "ORDER BY id DESC LIMIT ? OFFSET 1",
+                (destination, dep_date, ret_date, TYPICAL_LOOKBACK),
+            )
+        ]
+        new_alerted_typ = alerted_typ
+        if len(recent) >= TYPICAL_MIN_SAMPLES:
+            typical = statistics.median(recent)
+            below_pct = (typical - now_price) / typical
+            below_typical = below_pct >= BELOW_TYPICAL_PCT
+            # 저점이 이어지는 동안 매시간 반복 알림하지 않도록 플래그로 억제하고,
+            # 정상가로 돌아오면 플래그를 풀어 다음 저점 때 다시 알린다.
+            new_alerted_typ = 1 if below_typical else 0
+            if below_typical and not alerted_typ and alert is None:
+                alert = (
+                    f"🎯 평소보다 저렴 (-{below_pct:.0%}, 최근 중앙값 ₩{round(typical):,})\n{detail}"
+                )
+
+        best_price = now_price if now_price < prev_best else prev_best
+        conn.execute(
+            "UPDATE best SET best_price_krw=?, alerted_under_budget=?, alerted_below_typical=? "
+            "WHERE destination=? AND depart_date=? AND return_date=?",
+            (best_price, int(alerted or under_budget), int(new_alerted_typ),
+             destination, dep_date, ret_date),
+        )
 
     conn.commit()
     return alert
