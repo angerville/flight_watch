@@ -10,7 +10,7 @@ set PYTHONIOENCODING=utf-8
 
 rem Task Scheduler captures no stdout/stderr by default, so log to a file
 rem too -- otherwise a failure via the scheduler is undiagnosable.
-call "%~dp0..\_ensure_venv.bat" >> "%~dp0bot_run.log" 2>&1
+call "%~dp0_ensure_venv.bat" >> "%~dp0bot_run.log" 2>&1
 if errorlevel 1 goto :eof
 
 "%VENV_PY%" bot_commands.py >> "%~dp0bot_run.log" 2>&1

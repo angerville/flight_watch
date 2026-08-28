@@ -1,0 +1,66 @@
+name: 항공권 트래커 설정 봇 명령어 처리
+
+# flight_watch.yml(시간당 1회, Playwright 필요, 느림)과 분리된 가벼운 폴러.
+# 브라우저를 안 띄우니 훨씬 자주 돌려도 부담이 적고, 텔레그램으로 보낸
+# /budget, /dates, /destinations 같은 명령어에 거의 실시간으로 반응한다.
+#
+# config.yaml(사람이 손으로 편집)은 절대 건드리지 않고 state/overrides.json만
+# 갱신한다 — flight_watch.yml의 상태 DB 커밋과 건드리는 파일이 겹치지 않아
+# 두 워크플로가 동시에 돌아도 git push 충돌이 안 난다.
+#
+# 이 저장소는 flight_watch 전용이라 working-directory 지정이 필요 없다
+# (2026-08-28, 공모전 자동화 저장소에서 분리).
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: flight-watch-commands
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 리포지토리 체크아웃
+        uses: actions/checkout@v5
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 의존성 설치
+        run: pip install --quiet PyYAML requests
+
+      - name: 명령어 확인 및 처리
+        env:
+          FLIGHT_TELEGRAM_BOT_TOKEN: ${{ secrets.FLIGHT_TELEGRAM_BOT_TOKEN }}
+          FLIGHT_TELEGRAM_CHAT_ID: ${{ secrets.FLIGHT_TELEGRAM_CHAT_ID }}
+          PYTHONUNBUFFERED: "1"
+        run: python bot_commands.py
+
+      - name: 설정 변경분 커밋
+        if: always()
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/overrides.json state/telegram_offset.txt
+          if git diff --staged --quiet; then
+            exit 0
+          fi
+          git commit -m "chore(flight-watch): 설정 명령어 반영 $(date -u '+%Y-%m-%d %H:%M UTC')"
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push && exit 0
+            echo "푸시 재시도 $i..."
+            sleep 5
+          done
+          echo "::error::설정 커밋 푸시에 실패했습니다"
+          exit 1

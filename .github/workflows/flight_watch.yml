@@ -1,0 +1,68 @@
+name: 대련 출발 국경절 항공권 가격 트래커
+
+# 이 저장소는 flight_watch 전용이라 working-directory 지정이 필요 없다
+# (2026-08-28, 공모전 자동화 저장소에서 분리).
+#
+# GitHub 호스팅 러너(ubuntu-latest)를 쓴다 — PC를 계속 켜두지 않아도 돌아가야
+# 하기 때문이다. Google Flights는 이 IP대를 차단하지 않는 걸 확인했지만,
+# 클라우드 IP라 간헐적으로 결과가 비거나 실패할 수 있다 — track_prices.py는
+# 그런 실패를 건너뛰고 다음 실행에서 재시도하도록 설계됨.
+on:
+  schedule:
+    # 매시 13분. 정각(0분)은 전 세계 cron이 몰려 대기열 지연이 크므로 피함.
+    - cron: "13 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: flight-watch
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 리포지토리 체크아웃
+        uses: actions/checkout@v5
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: 가격 조회 실행
+        env:
+          FLIGHT_TELEGRAM_BOT_TOKEN: ${{ secrets.FLIGHT_TELEGRAM_BOT_TOKEN }}
+          FLIGHT_TELEGRAM_CHAT_ID: ${{ secrets.FLIGHT_TELEGRAM_CHAT_ID }}
+          PYTHONUNBUFFERED: "1"
+        run: python track_prices.py
+
+      - name: 상태 DB 커밋
+        if: always()
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A state/
+          if git diff --staged --quiet; then
+            echo "상태 변경 없음 — 커밋 생략"
+            exit 0
+          fi
+          git commit -m "chore(flight-watch): 가격 이력 갱신 $(date -u '+%Y-%m-%d %H:%M UTC')"
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push && exit 0
+            echo "푸시 재시도 $i..."
+            sleep 5
+          done
+          echo "::error::상태 DB 푸시에 실패했습니다"
+          exit 1

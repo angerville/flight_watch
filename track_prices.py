@@ -32,10 +32,10 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline.notify import TelegramNotifier  # noqa: E402
+from notify import TelegramNotifier  # noqa: E402
 from config_io import load_config  # noqa: E402
 
 HERE = Path(__file__).resolve().parent

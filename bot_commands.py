@@ -27,12 +27,11 @@ from pathlib import Path
 import requests
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
-sys.path.insert(0, str(ROOT))
+ROOT = HERE
 sys.path.insert(0, str(HERE))
 
 from config_io import load_base_config, load_config, load_overrides, save_overrides  # noqa: E402
-from pipeline.notify import TelegramNotifier  # noqa: E402
+from notify import TelegramNotifier  # noqa: E402
 
 OFFSET_PATH = HERE / "state" / "telegram_offset.txt"
 
