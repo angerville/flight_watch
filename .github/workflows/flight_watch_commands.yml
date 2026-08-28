@@ -37,7 +37,11 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # bot_commands.py는 RUN_DURATION_SECONDS(570초=9.5분) 동안 롱폴링하다가
+    # 스스로 종료한다. 예전엔 여기가 5분이라 스크립트가 끝나기도 전에 매번
+    # GitHub이 강제로 "cancelled" 처리했다(실측: 5분 8초 만에 취소). 스크립트
+    # 자체 종료 시간보다 여유 있게 잡는다.
+    timeout-minutes: 11
 
     steps:
       - name: 리포지토리 체크아웃
