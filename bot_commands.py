@@ -32,6 +32,7 @@ sys.path.insert(0, str(HERE))
 
 from config_io import load_base_config, load_config, load_overrides, save_overrides  # noqa: E402
 from notify import TelegramNotifier  # noqa: E402
+from lockfile import single_instance  # noqa: E402
 
 OFFSET_PATH = HERE / "state" / "telegram_offset.txt"
 
@@ -325,6 +326,21 @@ def handle_message(text: str, overrides: dict, cfg: dict) -> str | None:
 
 
 def main() -> None:
+    """진입점. 같은 스크립트가 이미 실행 중이면 조용히 건너뛴다.
+
+    작업 스케줄러의 IgnoreNew 설정을 이미 켜뒀지만, 실측으로 flight_watch
+    프로세스가 중복으로 뜬 걸 확인해서 스크립트 자체에도 락을 건다 (자세한
+    배경은 lockfile.py 참고). 이 스크립트는 실행 1회가 최대
+    RUN_DURATION_SECONDS만큼 롱폴링하므로, 스케줄 간격보다 오래 걸리면
+    다음 실행과 겹칠 수 있다.
+    """
+    with single_instance(HERE / "state" / ".bot_commands.lock", label="bot_commands") as acquired:
+        if not acquired:
+            return
+        _run()
+
+
+def _run() -> None:
     token, chat_id = _load_state()
     notifier = TelegramNotifier(token=token, chat_id=chat_id)
 

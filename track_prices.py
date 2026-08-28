@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT))
 
 from notify import TelegramNotifier  # noqa: E402
 from config_io import load_config  # noqa: E402
+from lockfile import single_instance  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
@@ -430,6 +431,19 @@ def check_and_record(
 
 
 def main() -> None:
+    """진입점. 같은 스크립트가 이미 실행 중이면 조용히 건너뛴다.
+
+    작업 스케줄러의 IgnoreNew 설정을 이미 켜뒀지만, 실측으로 프로세스 2개가
+    동시에 뜬 걸 확인해서 스크립트 자체에도 락을 건다 (자세한 배경은
+    lockfile.py 참고).
+    """
+    with single_instance(HERE / "state" / ".track_prices.lock", label="track_prices") as acquired:
+        if not acquired:
+            return
+        _run()
+
+
+def _run() -> None:
     cfg = load_config()
     db_path = HERE / cfg["state_db"]
     conn = init_db(db_path)
