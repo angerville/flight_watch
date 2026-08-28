@@ -21,6 +21,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -34,6 +35,19 @@ from config_io import load_base_config, load_config, load_overrides, save_overri
 from pipeline.notify import TelegramNotifier  # noqa: E402
 
 OFFSET_PATH = HERE / "state" / "telegram_offset.txt"
+
+#: 텔레그램 롱폴링 1회 대기시간(초). 이 시간 동안 새 메시지가 오면 즉시 반환된다.
+LONG_POLL_TIMEOUT_SECONDS = 50
+
+#: 이 스크립트 1회 실행이 살아 있는 시간(초).
+#: 예전에는 "한 번 확인하고 바로 종료"라 스케줄러 주기(10분)만큼 답장이 늦었다.
+#: 이제는 다음 실행이 시작되기 직전까지 롱폴링으로 대기해서 명령어에 즉시
+#: 반응한다. 작업 설정이 MultipleInstancesPolicy=IgnoreNew라 실행이 겹치면
+#: 새 인스턴스가 통째로 무시되므로, 10분 주기보다 반드시 짧게 끝내야 한다.
+RUN_DURATION_SECONDS = 570
+
+#: getUpdates가 실패했을 때 재시도까지 쉬는 시간(초)
+ERROR_RETRY_DELAY_SECONDS = 5
 
 # 표시 이름(한글) -> Google Flights 검색어(영문). /destinations, /adddest 에서 씀.
 # 대련에서 갈 만한 중국 국내 주요 도시 위주로 넉넉히 잡음 — 목록에 없으면
@@ -83,15 +97,20 @@ def _save_offset(offset: int) -> None:
     OFFSET_PATH.write_text(str(offset))
 
 
-def _fetch_messages(token: str, offset: int) -> tuple[list[dict], int]:
+def _fetch_messages(token: str, offset: int, poll_timeout: int = 0) -> tuple[list[dict], int]:
     """getUpdates로 새 메시지(텍스트)만 가져온다. TelegramNotifier.fetch_callbacks는
-    callback_query(버튼) 전용이라 여기선 별도로 직접 호출한다."""
+    callback_query(버튼) 전용이라 여기선 별도로 직접 호출한다.
+
+    poll_timeout > 0이면 텔레그램의 롱폴링을 쓴다 — 새 메시지가 생길 때까지 서버가
+    응답을 붙잡고 있다가 즉시 돌려주므로, 몇 분마다 확인하는 방식과 달리 반응이
+    바로 온다. HTTP 타임아웃은 롱폴링 대기시간보다 넉넉히 길어야 한다.
+    """
     url = f"https://api.telegram.org/bot{token}/getUpdates"
-    params = {"timeout": 0, "allowed_updates": '["message"]'}
+    params = {"timeout": poll_timeout, "allowed_updates": '["message"]'}
     if offset:
         params["offset"] = offset
 
-    resp = requests.get(url, params=params, timeout=30)
+    resp = requests.get(url, params=params, timeout=poll_timeout + 20)
     resp.raise_for_status()
     payload = resp.json()
     if not payload.get("ok"):
@@ -308,28 +327,50 @@ def handle_message(text: str, overrides: dict, cfg: dict) -> str | None:
 
 def main() -> None:
     token, chat_id = _load_state()
-    offset = _get_offset()
-    messages, next_offset = _fetch_messages(token, offset)
-
-    if not messages:
-        return
-
-    overrides = load_overrides()
     notifier = TelegramNotifier(token=token, chat_id=chat_id)
-    reply_count = 0
 
-    for msg in messages:
-        text = msg.get("text", "")
-        cfg = load_base_config()
-        cfg.update(overrides)  # 이전 명령어 반영분까지 누적 적용
-        reply = handle_message(text, overrides, cfg)
-        if reply:
-            notifier.send_message(reply, parse_mode="")
-            reply_count += 1
+    deadline = time.monotonic() + RUN_DURATION_SECONDS
+    total_messages = 0
+    total_replies = 0
 
-    save_overrides(overrides)
-    _save_offset(next_offset)
-    print(f"처리한 메시지 {len(messages)}건, 응답 {reply_count}건, 다음 offset={next_offset}")
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            break
+        poll_timeout = int(min(LONG_POLL_TIMEOUT_SECONDS, remaining - 1))
+
+        offset = _get_offset()
+        try:
+            messages, next_offset = _fetch_messages(token, offset, poll_timeout)
+        except Exception as e:  # noqa: BLE001 - 일시적 네트워크 오류로 죽지 않게
+            print(f"getUpdates 실패, {ERROR_RETRY_DELAY_SECONDS}초 후 재시도: {e}")
+            time.sleep(ERROR_RETRY_DELAY_SECONDS)
+            continue
+
+        # 텍스트 메시지가 없어도 offset은 넘겨야 한다. 안 그러면 사진 같은
+        # 비텍스트 업데이트가 계속 대기열에 남아 롱폴링이 즉시 반환되면서
+        # API를 쉴 새 없이 두드리게 된다.
+        if not messages:
+            if next_offset != offset:
+                _save_offset(next_offset)
+            continue
+
+        overrides = load_overrides()
+        for msg in messages:
+            text = msg.get("text", "")
+            cfg = load_base_config()
+            cfg.update(overrides)  # 이전 명령어 반영분까지 누적 적용
+            reply = handle_message(text, overrides, cfg)
+            if reply:
+                notifier.send_message(reply, parse_mode="")
+                total_replies += 1
+
+        save_overrides(overrides)
+        _save_offset(next_offset)
+        total_messages += len(messages)
+        print(f"처리한 메시지 {len(messages)}건, 다음 offset={next_offset}", flush=True)
+
+    print(f"종료: 이번 실행에서 메시지 {total_messages}건, 응답 {total_replies}건")
 
 
 if __name__ == "__main__":
