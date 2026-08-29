@@ -17,10 +17,26 @@ import logging
 import os
 import sys
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
 log = logging.getLogger(__name__)
+
+#: 락 파일이 이만큼 오래되면 PID가 살아 있어 보여도 "멈춘 실행"으로 보고 회수한다.
+#: 노트북을 실행 도중 닫으면(절전) 그 프로세스가 죽지도 정리되지도 않은 채 남아,
+#: 다음 실행마다 _pid_alive 가 True 를 돌려주며 영원히 건너뛰는 사고가 났다.
+#: 정상 실행이 절대 이보다 오래 걸리지 않는 값으로 호출부가 정한다.
+DEFAULT_STALE_AFTER = timedelta(minutes=20)
+
+
+def _fmt_age(delta: timedelta | None) -> str:
+    if delta is None:
+        return "?"
+    mins = max(0, int(delta.total_seconds() // 60))
+    if mins < 120:
+        return f"{mins}분"
+    return f"{mins // 60}시간 {mins % 60}분"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -42,7 +58,11 @@ def _pid_alive(pid: int) -> bool:
 
 
 @contextmanager
-def single_instance(lock_path: Path, label: str = "") -> Iterator[bool]:
+def single_instance(
+    lock_path: Path,
+    label: str = "",
+    stale_after: timedelta = DEFAULT_STALE_AFTER,
+) -> Iterator[bool]:
     """이미 같은 스크립트가 실행 중이면 `False`를 준다 — 호출부가 조용히 종료해야 한다.
 
     사용법:
@@ -53,6 +73,10 @@ def single_instance(lock_path: Path, label: str = "") -> Iterator[bool]:
 
     락을 얻었으면(True) with 블록이 끝날 때(정상 종료든 예외든) 자동으로
     락 파일을 지운다.
+
+    `stale_after`보다 오래된 락은 그 PID가 살아 있어 보여도 회수한다 — 절전으로
+    멈춘(죽지도 정리되지도 않은) 이전 실행이 다음 실행들을 영원히 막던 문제 방지.
+    정상 실행이 절대 이보다 오래 걸리지 않는 값을 호출부가 넘겨야 한다.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -62,18 +86,34 @@ def single_instance(lock_path: Path, label: str = "") -> Iterator[bool]:
         except (ValueError, OSError):
             existing_pid = None
 
-        if existing_pid is not None and _pid_alive(existing_pid):
+        try:
+            age: timedelta | None = datetime.now(timezone.utc) - datetime.fromtimestamp(
+                lock_path.stat().st_mtime, tz=timezone.utc
+            )
+        except OSError:
+            age = None
+
+        alive = existing_pid is not None and _pid_alive(existing_pid)
+        stale_by_age = age is not None and age > stale_after
+
+        if alive and not stale_by_age:
             log.warning(
-                "%s이미 실행 중인 인스턴스가 있어 건너뜁니다 (PID %d)",
-                f"{label}: " if label else "", existing_pid,
+                "%s이미 실행 중인 인스턴스가 있어 건너뜁니다 (PID %d, 락 %s 경과)",
+                f"{label}: " if label else "", existing_pid, _fmt_age(age),
             )
             yield False
             return
 
-        log.info(
-            "%s이전 실행이 남긴 락 파일 정리 (PID %s는 이미 종료됨)",
-            f"{label}: " if label else "", existing_pid,
-        )
+        if alive and stale_by_age:
+            log.warning(
+                "%sPID %d가 살아 있으나 락이 %s째 진행 없음 — 멈춘 실행으로 보고 회수합니다",
+                f"{label}: " if label else "", existing_pid, _fmt_age(age),
+            )
+        else:
+            log.info(
+                "%s이전 실행이 남긴 락 파일 정리 (PID %s는 이미 종료됨)",
+                f"{label}: " if label else "", existing_pid,
+            )
 
     lock_path.write_text(str(os.getpid()))
     try:

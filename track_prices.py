@@ -29,6 +29,7 @@ import sys
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -522,7 +523,13 @@ def main() -> None:
     동시에 뜬 걸 확인해서 스크립트 자체에도 락을 건다 (자세한 배경은
     lockfile.py 참고).
     """
-    with single_instance(HERE / "state" / ".track_prices.lock", label="track_prices") as acquired:
+    # 1회 조회는 길어야 40분 안팎. 90분 넘게 락이 잡혀 있으면 절전 등으로 멈춘
+    # 실행이므로 회수한다 (작업 스케줄러 실행 시간 제한 2시간보다 짧게 잡음).
+    with single_instance(
+        HERE / "state" / ".track_prices.lock",
+        label="track_prices",
+        stale_after=timedelta(minutes=90),
+    ) as acquired:
         if not acquired:
             return
         _run()
