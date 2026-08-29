@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
     flight_watch 작업 스케줄러 등록 스크립트.
 
