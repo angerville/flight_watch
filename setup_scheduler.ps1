@@ -15,6 +15,11 @@
       * 로그인한 현재 사용자로, "로그인했을 때만" 실행 (암호 저장 불필요).
         -> 그 PC를 실제로 쓰는 동안에만 돈다. PC가 꺼져 있는 구간은
            GitHub Actions 워크플로(6시간 간격)가 메꾼다 - 의도된 분담이다.
+      * .bat 를 직접 실행하지 않고 run_hidden.vbs(wscript) 로 감싸 실행한다.
+        LogonType=Interactive 로 .bat 를 직접 돌리면 매 실행마다 빈 cmd 창이
+        떴다 사라지는데, wscript 래퍼가 창 스타일 0(숨김)으로 돌려 창이 아예
+        안 뜨게 한다. 래퍼는 배치가 끝날 때까지 대기하므로 실행 시간/중복
+        방지/종료 코드는 그대로 정상 인식된다.
       * MultipleInstances=IgnoreNew : 이전 실행이 안 끝났으면 새 실행은 건너뜀
         (lockfile.py 의 스크립트 레벨 락과 이중 방어).
       * StartWhenAvailable : PC가 꺼져 있어 놓친 실행은 켜지면 곧 한 번 따라 실행.
@@ -35,6 +40,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $folder = '\FlightWatch\'
+
+# .bat 를 숨겨서 실행하는 wscript 래퍼. 이게 없으면 매 실행마다 빈 cmd 창이 뜬다.
+$hiddenVbs = Join-Path $here 'run_hidden.vbs'
 
 $tasks = @(
     [pscustomobject]@{
@@ -79,6 +87,9 @@ foreach ($t in $tasks) {
         throw "배치 파일을 찾을 수 없습니다: $($t.Bat)`nOneDrive 동기화가 끝났는지 확인하세요."
     }
 }
+if (-not (Test-Path -LiteralPath $hiddenVbs)) {
+    throw "숨김 실행 래퍼를 찾을 수 없습니다: $hiddenVbs`nOneDrive 동기화가 끝났는지 확인하세요."
+}
 
 $userId = "$env:USERDOMAIN\$env:USERNAME"
 Write-Host "실행 계정: $userId  (로그인 상태에서만 실행)"
@@ -88,7 +99,10 @@ Write-Host ""
 foreach ($t in $tasks) {
     Remove-FlightWatchTask -Name $t.Name
 
-    $action = New-ScheduledTaskAction -Execute $t.Bat -WorkingDirectory $here
+    # .bat 를 직접 실행하지 않고 run_hidden.vbs 로 감싸 창 없이 실행한다.
+    $action = New-ScheduledTaskAction -Execute 'wscript.exe' `
+        -Argument ('"{0}" "{1}"' -f $hiddenVbs, $t.Bat) `
+        -WorkingDirectory $here
 
     # -Once + RepetitionInterval 로 무한 반복 트리거를 만든다. PowerShell 5.1의
     # New-ScheduledTaskTrigger 는 -RepetitionInterval 파라미터를 직접 노출하지

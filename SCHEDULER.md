@@ -20,6 +20,9 @@ powershell -ExecutionPolicy Bypass -File .\setup_scheduler.ps1
 | `bot_commands` | `run_bot_commands.bat` | 10분마다 | 텔레그램 명령어 롱폴링(1회 570초 상주) |
 
 - **로그인 상태에서만** 실행 → 그 PC를 실제로 쓰는 동안만 돈다.
+- 두 작업 다 `run_hidden.vbs`(wscript)로 감싸 **창 없이** 실행된다. 예전엔
+  10분마다 빈 cmd 창이 떴다 사라졌는데, 이 래퍼가 창을 숨긴다. 예전 방식으로
+  이미 등록해 뒀다면 `setup_scheduler.ps1`을 **다시 실행**해야 새 방식으로 바뀐다.
 - PC가 꺼져 있는 구간은 GitHub Actions 워크플로(6시간 간격)가 메꾼다.
 - 두 PC를 동시에 켜두지는 말 것 — 같은 텔레그램 봇 토큰을 두 곳에서 폴링하면
   명령어를 서로 뺏어간다(`.github/workflows/flight_watch_commands.yml` 주석 참고).
