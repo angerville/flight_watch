@@ -54,48 +54,45 @@ open_jaw:
 
 # 검색 대상 도시. Google Flights 검색어에 그대로 들어가므로 영문 도시명을
 # 쓴다. display는 텔레그램 메시지용 한글 표기.
-# 원래는 중국 국내로만 한정했다가, 예산만 맞으면 어디든 상관없다는 원래
-# 취지에 맞춰 일본·대만·홍콩·마카오·동남아까지 넓혔다 (한국은 출발지 기준
-# 여행지로서 의미가 없어 제외). Google Flights는 "어디든" 같은 자연어나
-# /travel/flights/explore 지도 검색은 날짜를 무시해버려 자동화가 안 되므로,
-# 후보 도시를 정해두고 하나씩 정확한 날짜로 조회하는 지금 방식을 유지한다.
+# 한때 일본·대만·홍콩·동남아까지 넓혔다가, 대련에서 국경절에 갈 곳은 중국
+# 국내로 본다는 판단으로 다시 중국 주요 도시들로 좁혔다. Google Flights는
+# "어디든" 같은 자연어나 /travel/flights/explore 지도 검색은 날짜를 무시해
+# 자동화가 안 되므로, 후보 도시를 정해두고 하나씩 정확한 날짜로 조회하는
+# 지금 방식을 유지한다.
 destinations:
-  # 중국 국내
-  - {query: "Sanya",        display: "싼야(하이난)"}
-  - {query: "Kunming",      display: "쿤밍"}
-  - {query: "Lijiang",      display: "리장"}
-  - {query: "Xiamen",       display: "샤먼"}
-  - {query: "Guilin",       display: "구이린"}
-  - {query: "Zhangjiajie",  display: "장자제"}
-  - {query: "Chengdu",      display: "청두"}
-  - {query: "Chongqing",    display: "충칭"}
-  - {query: "Xian",         display: "시안"}
+  # 화북 · 동북
+  - {query: "Beijing",      display: "베이징"}
+  - {query: "Tianjin",      display: "톈진"}
   - {query: "Qingdao",      display: "칭다오"}
+  - {query: "Jinan",        display: "지난"}
+  - {query: "Shenyang",     display: "선양"}
+  - {query: "Changchun",    display: "창춘"}
+  - {query: "Harbin",       display: "하얼빈"}
+  # 화동
   - {query: "Shanghai",     display: "상하이"}
+  - {query: "Nanjing",      display: "난징"}
+  - {query: "Hangzhou",     display: "항저우"}
+  - {query: "Xiamen",       display: "샤먼"}
+  # 화중
+  - {query: "Wuhan",        display: "우한"}
+  - {query: "Zhengzhou",    display: "정저우"}
+  - {query: "Changsha",     display: "창사"}
+  - {query: "Zhangjiajie",  display: "장자제"}
+  # 화남
   - {query: "Guangzhou",    display: "광저우"}
   - {query: "Shenzhen",     display: "선전"}
-  - {query: "Changsha",     display: "창사"}
+  - {query: "Guilin",       display: "구이린"}
+  - {query: "Sanya",        display: "싼야(하이난)"}
+  - {query: "Haikou",       display: "하이커우"}
+  # 서남 · 서북
+  - {query: "Chengdu",      display: "청두"}
+  - {query: "Chongqing",    display: "충칭"}
   - {query: "Guiyang",      display: "구이양"}
-  # 일본
-  - {query: "Tokyo",        display: "도쿄"}
-  - {query: "Osaka",        display: "오사카"}
-  - {query: "Fukuoka",      display: "후쿠오카"}
-  - {query: "Sapporo",      display: "삿포로"}
-  # 대만 · 홍콩 · 마카오
-  - {query: "Taipei",       display: "타이베이"}
-  - {query: "Hong Kong",    display: "홍콩"}
-  - {query: "Macau",        display: "마카오"}
-  # 동남아
-  - {query: "Bangkok",         display: "방콕"}
-  - {query: "Ho Chi Minh City", display: "호치민"}
-  - {query: "Hanoi",           display: "하노이"}
-  - {query: "Da Nang",         display: "다낭"}
-  - {query: "Manila",          display: "마닐라"}
-  - {query: "Cebu",            display: "세부"}
-  - {query: "Singapore",       display: "싱가포르"}
-  - {query: "Kuala Lumpur",    display: "쿠알라룸푸르"}
-  - {query: "Phnom Penh",      display: "프놈펜"}
-  - {query: "Bali",            display: "발리"}
+  - {query: "Kunming",      display: "쿤밍"}
+  - {query: "Lijiang",      display: "리장"}
+  - {query: "Xian",         display: "시안"}
+  - {query: "Lanzhou",      display: "란저우"}
+  - {query: "Urumqi",       display: "우루무치"}
 
 # 목적지 사이 요청 간 딜레이(초). 너무 빠르게 연달아 조회하지 않도록 배려.
 request_delay_seconds: 4
