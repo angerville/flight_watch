@@ -484,7 +484,7 @@ def build_digest(
     conn: sqlite3.Connection,
     run_results: list[tuple[str, str, str, int]],
     budget_krw: int,
-    top_n: int,
+    top_n: int | None,
     max_price_krw: int | None = None,
 ) -> str:
     """이번 조회 결과 현황 요약을 만든다 (가격 변동이 없어도 매번 보내는 용도).
@@ -514,12 +514,15 @@ def build_digest(
     shown = [r for r in rows if max_price_krw is None or r[0] <= max_price_krw]
     hidden = len(rows) - len(shown)
 
+    # top_n이 None이거나 0 이하면 (상한가 이하) 전부 표시한다.
+    limit = top_n if (top_n and top_n > 0) else len(shown)
+
     lines = [
         f"✈️ 항공권 현황 ({time.strftime('%m/%d %H:%M')})",
         f"예산 ₩{budget_krw:,} 이내: {len(within)}건 / 조회 {len(rows)}건",
         "─" * 20,
     ]
-    for price, display, dep_date, prev_price in shown[:top_n]:
+    for price, display, dep_date, prev_price in shown[:limit]:
         if prev_price is None:
             delta = " (신규)"
         elif price > prev_price:
@@ -531,8 +534,8 @@ def build_digest(
         mark = "💰" if price <= budget_krw else "·"
         lines.append(f"{mark} {display} {dep_date[5:]} ₩{price:,}{delta}")
 
-    if len(shown) > top_n:
-        lines.append(f"…외 {len(shown) - top_n}건")
+    if len(shown) > limit:
+        lines.append(f"…외 {len(shown) - limit}건")
     if hidden:
         lines.append(f"(상한 ₩{max_price_krw:,} 초과 {hidden}건 숨김)")
     return "\n".join(lines)
@@ -727,7 +730,7 @@ def _run() -> None:
         messages.append(header + "\n\n".join(alerts))
     if cfg.get("hourly_digest"):
         digest = build_digest(
-            conn, run_results, cfg["budget_krw"], cfg.get("digest_top_n", 10),
+            conn, run_results, cfg["budget_krw"], cfg.get("digest_top_n"),
             cfg.get("max_price_krw"),
         )
         if open_jaw_lines:
