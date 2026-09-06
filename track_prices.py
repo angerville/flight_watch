@@ -480,6 +480,83 @@ def check_open_jaw(page, conn, cfg) -> list[str]:
     return lines
 
 
+def check_watch_trips(page, conn, cfg) -> tuple[list[str], list[str]]:
+    """config의 watch_trips에 지정된 여정을 그대로 조회한다.
+
+    대련 국경절 검색과 무관하게, 완전히 명시된 여정(출발지·구간·날짜 고정,
+    오픈조 포함)을 매 실행마다 있는 그대로 조회한다. 각 여정은 자기
+    budget_krw / max_price_krw 로 판정한다.
+
+    돌려주는 값: (알림 메시지 목록, 현황 요약에 붙일 줄 목록)
+    """
+    trips = cfg.get("watch_trips") or []
+    if not trips:
+        return [], []
+
+    alert_msgs: list[str] = []
+    digest_lines: list[str] = ["", "✈️ 지정 여정"]
+    got_any = False
+
+    for trip in trips:
+        name = trip["name"]
+        legs = [(leg["date"], leg["from"], leg["to"]) for leg in trip["legs"]]
+        dep_date, ret_date = legs[0][0], legs[-1][0]
+        budget = trip.get("budget_krw", 0)
+        ceil = trip.get("max_price_krw")
+        route = " / ".join(f"{frm}→{to}" for _, frm, to in legs)
+
+        # A→B, B→A 처럼 딱 왕복이면 왕복운임으로, 아니면(오픈조 등) 다구간으로.
+        is_round = (
+            len(legs) == 2
+            and legs[0][1] == legs[1][2]
+            and legs[0][2] == legs[1][1]
+        )
+        trip_type = TRIP_ROUND if is_round else TRIP_MULTI_CITY
+
+        found = fetch_outbound_legs(page, build_tfs_url(legs, trip_type), cfg["render_wait_ms"])
+        if not found and not page_alive(page):
+            log.warning("브라우저가 죽어 재시작합니다 (지정 여정) — 남은 여정은 다음 실행에서")
+            break
+
+        result = pick_cheapest(found, None)
+        key = f"WT:{name}"
+
+        if result is None:
+            log.info("지정 여정 실패 — 건너뜀: %s (%s)", name, route)
+            digest_lines.append(f"  {name}: 조회 실패")
+            time.sleep(cfg["request_delay_seconds"])
+            continue
+
+        got_any = True
+        log.info("지정 여정 %s (%s): ₩%s", name, route, f"{result.price_krw:,}")
+
+        prev = conn.execute(
+            "SELECT price_krw FROM checks WHERE destination=? AND depart_date=? "
+            "ORDER BY id DESC LIMIT 1",
+            (key, dep_date),
+        ).fetchone()
+        prev_price = prev[0] if prev else None
+
+        alert = check_and_record(conn, key, name, dep_date, ret_date, result, budget, ceil)
+        if alert:
+            alert_msgs.append(f"{alert}\n[여정] {route} · {dep_date}~{ret_date}")
+
+        if prev_price is None:
+            delta = " (신규)"
+        elif result.price_krw > prev_price:
+            delta = f" ▲{result.price_krw - prev_price:,}"
+        elif result.price_krw < prev_price:
+            delta = f" ▼{prev_price - result.price_krw:,}"
+        else:
+            delta = " ="
+        budget_txt = f"  (예산 ₩{budget:,})" if budget else ""
+        digest_lines.append(f"  {name} {dep_date[5:]}~{ret_date[5:]} ₩{result.price_krw:,}{delta}{budget_txt}")
+
+        time.sleep(cfg["request_delay_seconds"])
+
+    return alert_msgs, (digest_lines if got_any else [])
+
+
 def build_digest(
     conn: sqlite3.Connection,
     run_results: list[tuple[str, str, str, int]],
@@ -717,6 +794,7 @@ def _run() -> None:
                 time.sleep(cfg["request_delay_seconds"])
 
         open_jaw_lines = check_open_jaw(page, conn, cfg)
+        wt_alerts, wt_lines = check_watch_trips(page, conn, cfg)
 
         close_quietly(browser)
 
@@ -728,6 +806,9 @@ def _run() -> None:
     if alerts:
         header = f"✈️ 대련 출발 국경절 항공권 알림 ({len(alerts)}건)\n{'─' * 20}\n"
         messages.append(header + "\n\n".join(alerts))
+    if wt_alerts:
+        wt_header = f"✈️ 지정 여정 알림 ({len(wt_alerts)}건)\n{'─' * 20}\n"
+        messages.append(wt_header + "\n\n".join(wt_alerts))
     if cfg.get("hourly_digest"):
         digest = build_digest(
             conn, run_results, cfg["budget_krw"], cfg.get("digest_top_n"),
@@ -735,6 +816,8 @@ def _run() -> None:
         )
         if open_jaw_lines:
             digest += "\n" + "\n".join(open_jaw_lines)
+        if wt_lines:
+            digest += "\n" + "\n".join(wt_lines)
         messages.append(digest)
 
     if messages:
