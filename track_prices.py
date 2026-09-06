@@ -487,6 +487,11 @@ def check_watch_trips(page, conn, cfg) -> tuple[list[str], list[str]]:
     오픈조 포함)을 매 실행마다 있는 그대로 조회한다. 각 여정은 자기
     budget_krw / max_price_krw 로 판정한다.
 
+    trip에 match={airline, depart}가 있으면 그 조건에 맞는 항공편만 골라
+    추적한다(항공사·가는편 출발시각 지정). 없으면 그 구간의 최저가를 추적.
+    ※ 파싱되는 건 가는편 카드뿐이라 귀국편 시각은 고정할 수 없다 —
+      match의 depart는 가는편 출발시각이고, 귀국편은 구글이 묶어주는 대로다.
+
     돌려주는 값: (알림 메시지 목록, 현황 요약에 붙일 줄 목록)
     """
     trips = cfg.get("watch_trips") or []
@@ -518,12 +523,21 @@ def check_watch_trips(page, conn, cfg) -> tuple[list[str], list[str]]:
             log.warning("브라우저가 죽어 재시작합니다 (지정 여정) — 남은 여정은 다음 실행에서")
             break
 
-        result = pick_cheapest(found, None)
+        match = trip.get("match") or {}
+        want_airline = match.get("airline")
+        want_depart = match.get("depart")
+        cands = [
+            f for f in found
+            if (not want_airline or want_airline in f.airline)
+            and (not want_depart or f.dep_display == want_depart)
+        ]
+        result = min(cands, key=lambda f: f.price_krw) if cands else None
         key = f"WT:{name}"
 
         if result is None:
-            log.info("지정 여정 실패 — 건너뜀: %s (%s)", name, route)
-            digest_lines.append(f"  {name}: 조회 실패")
+            why = "지정 항공편 없음" if (want_airline or want_depart) and found else "조회 실패"
+            log.info("지정 여정 건너뜀 (%s): %s (%s)", why, name, route)
+            digest_lines.append(f"  {name}: {why}")
             time.sleep(cfg["request_delay_seconds"])
             continue
 
