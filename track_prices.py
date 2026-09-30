@@ -1,4 +1,10 @@
-"""대련(DLC) 출발 국경절 항공권 최저가 트래커.
+"""대련(DLC) 출발 · 인천(ICN) 도착 오픈조 항공권 최저가 트래커.
+
+대련에서 나가서(1월 9~11일 사이) 후보 경유/체류 도시 하나를 거쳐, 인천으로
+들어오는(1월 22~24일 사이) 여정을 추적한다. 출발지와 최종 도착지가 달라
+"들어가는 도시 != 나오는 도시"인 오픈조라 자연어 질의("Flights from A to B")로는
+조회가 안 된다 — 대신 구글 항공권이 검색 조건을 URL의 tfs 파라미터(protobuf를
+base64url로 인코딩한 것)에 싣는 걸 이용해 직접 만들어 붙인다.
 
 Ctrip/Trip.com은 자체 WAF("whaleguard")가 requests는 물론 Playwright 헤드리스
 브라우저 접근까지 즉시 차단한다 (확인 결과 상태코드 432, 본문 "whaleguard
@@ -7,19 +13,20 @@ block"). 이를 우회하려면 안티디텍션/프록시 같은 차단 회피 �
 고정할 수 있어, 데이터 소스로 Google Flights만 쓴다.
 
 가격/시각 파싱은 화면에 렌더링된 텍스트 줄 순서가 아니라 각 항공편 카드의
-스크린리더용 aria-label 문장("왕복 총 가격은 최저 233808 대한민국
-원입니다...")을 정규식으로 파싱한다 — 경유편이 끼어들면 줄 수가 달라지는
-줄-순서 기반 파싱보다 훨씬 안정적이다.
+스크린리더용 aria-label 문장("총 가격은 최저 233808 대한민국 원입니다...")을
+정규식으로 파싱한다 — 경유편이 끼어들면 줄 수가 달라지는 줄-순서 기반 파싱보다
+훨씬 안정적이다.
 
-실행 1회 = 설정된 목적지 x 출발일 조합을 모두 조회해 최저가를 기록하고,
-사상 최저가 갱신 또는 예산 이내 진입 시에만 텔레그램으로 알린다 (매번 알리면
-스팸이 되므로). 귀국편 시각은 비용이 커서(항공편 하나를 실제로 클릭해 다음
-화면까지 들어가야 함) 매 조회마다 구하지 않고, 알림을 보낼 때만 그 항공편에
-한해 조회한다.
+실행 1회 = 설정된 경유지 x 출발일 x 도착일 조합을 모두 조회해 최저가를
+기록하고, 사상 최저가 갱신 또는 예산 이내 진입 시에만 텔레그램으로 알린다
+(매번 알리면 스팸이 되므로). 오는편(인천행) 시각은 비용이 커서(항공편 하나를
+실제로 클릭해 다음 화면까지 들어가야 함) 매 조회마다 구하지 않고, 알림을
+보낼 때만 그 항공편에 한해 조회한다.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 import sqlite3
@@ -27,7 +34,6 @@ import statistics
 import subprocess
 import sys
 import time
-import urllib.parse
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -38,7 +44,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from notify import TelegramNotifier  # noqa: E402
-from config_io import load_config  # noqa: E402
+from config_io import iter_combos, load_config, region_thresholds  # noqa: E402
 from lockfile import single_instance  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -184,9 +190,49 @@ def init_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def build_url(origin: str, dest_query: str, dep_date: str, ret_date: str) -> str:
-    q = f"Flights from {origin} to {dest_query} on {dep_date} through {ret_date}"
-    return f"https://www.google.com/travel/flights?q={urllib.parse.quote(q)}&hl=ko&gl=KR&curr=KRW"
+#: 오픈조/다구간 tfs 인코딩용 트립 타입. 딱 왕복(같은 도시로 들고 남)이면
+#: TRIP_ROUND, 들어가는 곳과 나오는 곳이 다르면 TRIP_MULTI_CITY.
+TRIP_ROUND = 1
+TRIP_MULTI_CITY = 3
+
+
+def _pb_varint(n: int) -> bytes:
+    out = b""
+    while True:
+        chunk = n & 0x7F
+        n >>= 7
+        out += bytes([chunk | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+def _pb_bytes(field: int, data: bytes) -> bytes:
+    return _pb_varint((field << 3) | 2) + _pb_varint(len(data)) + data
+
+
+def _pb_str(field: int, s: str) -> bytes:
+    return _pb_bytes(field, s.encode())
+
+
+def _pb_int(field: int, n: int) -> bytes:
+    return _pb_varint(field << 3) + _pb_varint(n)
+
+
+def build_tfs_url(legs: list[tuple[str, str, str]], trip: int) -> str:
+    """구간 목록으로 구글 항공권 조회 URL을 만든다.
+
+    legs: [(출발일 YYYY-MM-DD, 출발지 IATA, 도착지 IATA), ...]
+    trip: TRIP_ROUND(왕복) 또는 TRIP_MULTI_CITY(다구간/오픈조)
+    """
+    body = b""
+    for date, frm, to in legs:
+        leg = _pb_str(2, date) + _pb_bytes(13, _pb_str(2, frm)) + _pb_bytes(14, _pb_str(2, to))
+        body += _pb_bytes(3, leg)
+    body += _pb_int(8, 1)      # 성인 1명
+    body += _pb_int(9, 1)      # 이코노미
+    body += _pb_int(19, trip)
+    tfs = base64.urlsafe_b64encode(body).decode().rstrip("=")
+    return f"https://www.google.com/travel/flights?tfs={tfs}&hl=ko&gl=KR&curr=KRW"
 
 
 # 항공편 카드의 aria-label 파싱. "왕복 총 가격은 최저 ..." 형태이고, 가격은
@@ -268,13 +314,40 @@ def fetch_outbound_legs(page, url: str, render_wait_ms: int) -> list[FlightLeg]:
         log.warning("비정상 응답 status=%s url=%s", resp.status if resp else None, url)
         return []
 
-    page.wait_for_timeout(render_wait_ms)
+    # 결과가 뜨는 즉시 읽는다. 예전엔 고정 시간(9초)만 기다렸는데, 구글이 처음
+    # 계산하는 조합(한 번도 조회 안 한 날짜·공항 쌍)은 첫 카드가 뜨기까지 10초
+    # 넘게 걸리기도 해서(실측 12초) 결과가 있는데도 "없음"으로 놓쳤다. 반대로
+    # 이미 계산된 조합은 1~5초면 뜨니 폴링하면 평균 조회도 빨라진다.
+    # render_wait_ms는 이제 "최대 대기 시간"이다.
+    deadline = time.monotonic() + render_wait_ms / 1000
+    legs: list[FlightLeg] = []
+    noprice_since: float | None = None
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(500)
+        legs = _extract_legs(page)
+        if legs:
+            # 카드가 하나씩 그려지므로 나머지가 마저 뜰 여유를 준 뒤 다시 읽는다.
+            page.wait_for_timeout(1500)
+            legs = _extract_legs(page)
+            break
+
+        # 항공편 목록은 떴는데 전부 "가격을 확인할 수 없습니다"면(그 조합엔 판매 중인
+        # 운임이 없음) 더 기다려도 소용없다. 잠깐 뜨는 자리표시일 수 있으니 4초
+        # 넘게 이어질 때만 포기한다.
+        body = page.inner_text("body")
+        if "개가 반환되었습니다" in body and "가격을 확인할 수 없습니다" in body:
+            noprice_since = noprice_since or time.monotonic()
+            if time.monotonic() - noprice_since >= 4:
+                break
+        else:
+            noprice_since = None
+
     body = page.inner_text("body")
     if "whaleguard" in body.lower():
         log.error("차단 응답 감지 (whaleguard) — 조회 중단: %s", url)
         return []
 
-    return _extract_legs(page)
+    return legs
 
 
 def fetch_return_leg(page, outbound: FlightLeg, render_wait_ms: int) -> FlightLeg | None:
@@ -362,36 +435,38 @@ def close_quietly(browser) -> None:
 
 def build_digest(
     conn: sqlite3.Connection,
-    run_results: list[tuple[str, str, str, int]],
-    budget_krw: int,
+    run_results: list[tuple[str, str, str, str, int, int, int | None]],
     top_n: int | None,
-    max_price_krw: int | None = None,
 ) -> str:
     """이번 조회 결과 현황 요약을 만든다 (가격 변동이 없어도 매번 보내는 용도).
 
     직전 조회가와 비교한 등락(▲▼)을 같이 보여줘, 값이 그대로인지 움직이는
     중인지 한눈에 알 수 있게 한다.
+
+    run_results: (경유지 키, display, 출발일, 도착일, 가격, 예산, 상한가). 지역마다
+    가격대가 크게 달라 예산/상한가를 행마다 따로 들고 있다. 같은 공항 조합에 날짜
+    조합이 여러 개 있을 수 있어 이전가 조회 때 도착일도 같이 걸러야 서로 다른
+    조합끼리 안 섞인다.
     """
     if not run_results:
         return "✈️ 이번 조회에서 가격을 가져오지 못했습니다."
 
     rows = []
-    for dest_query, display, dep_date, price in run_results:
+    for dest_key, display, dep_date, ret_date, price, budget, ceiling in run_results:
         prev = conn.execute(
-            "SELECT price_krw FROM checks WHERE destination=? AND depart_date=? "
+            "SELECT price_krw FROM checks WHERE destination=? AND depart_date=? AND return_date=? "
             "ORDER BY id DESC LIMIT 2",
-            (dest_query, dep_date),
+            (dest_key, dep_date, ret_date),
         ).fetchall()
         # [0]은 방금 기록한 이번 조회가라 [1]이 직전 조회가.
         prev_price = prev[1][0] if len(prev) > 1 else None
-        rows.append((price, display, dep_date, prev_price))
+        rows.append((price, display, dep_date, ret_date, prev_price, budget, ceiling))
 
     rows.sort(key=lambda r: r[0])
-    within = [r for r in rows if r[0] <= budget_krw]
+    within = [r for r in rows if r[0] <= r[5]]
 
-    # 상한가를 넘는 노선(리장·싼야처럼 늘 100만원대인 곳)은 요약에서 뺀다.
-    # 상한이 없거나 그 이하인 것만 남긴다.
-    shown = [r for r in rows if max_price_krw is None or r[0] <= max_price_krw]
+    # 자기 지역 상한가를 넘는 조합은 요약에서 뺀다. 상한이 없거나 그 이하인 것만 남긴다.
+    shown = [r for r in rows if r[6] is None or r[0] <= r[6]]
     hidden = len(rows) - len(shown)
 
     # top_n이 None이거나 0 이하면 (상한가 이하) 전부 표시한다.
@@ -399,10 +474,10 @@ def build_digest(
 
     lines = [
         f"✈️ 항공권 현황 ({time.strftime('%m/%d %H:%M')})",
-        f"예산 ₩{budget_krw:,} 이내: {len(within)}건 / 조회 {len(rows)}건",
+        f"💰 예산 이내: {len(within)}건 / 조회 {len(rows)}건",
         "─" * 20,
     ]
-    for price, display, dep_date, prev_price in shown[:limit]:
+    for price, display, dep_date, ret_date, prev_price, budget, _ceiling in shown[:limit]:
         if prev_price is None:
             delta = " (신규)"
         elif price > prev_price:
@@ -411,13 +486,13 @@ def build_digest(
             delta = f" ▼{prev_price - price:,}"
         else:
             delta = " ="
-        mark = "💰" if price <= budget_krw else "·"
-        lines.append(f"{mark} {display} {dep_date[5:]} ₩{price:,}{delta}")
+        mark = "💰" if price <= budget else "·"
+        lines.append(f"{mark} {display} {dep_date[5:]}→{ret_date[5:]} ₩{price:,}{delta}")
 
     if len(shown) > limit:
         lines.append(f"…외 {len(shown) - limit}건")
     if hidden:
-        lines.append(f"(상한 ₩{max_price_krw:,} 초과 {hidden}건 숨김)")
+        lines.append(f"(지역별 상한가 초과 {hidden}건 숨김)")
     return "\n".join(lines)
 
 
@@ -451,9 +526,9 @@ def check_and_record(
 
     alert = None
     detail = (
-        f"{display} ({dep_date})\n"
+        f"{display} ({dep_date} → {ret_date})\n"
         f"[가는편] {result.dep_display} 출발 · {result.airline} · {result.stops} · {result.arr_airport} 도착\n"
-        f"₩{result.price_krw:,} 왕복"
+        f"₩{result.price_krw:,}"
     )
 
     if row is None:
@@ -546,71 +621,106 @@ def _run() -> None:
     conn = init_db(db_path)
 
     alerts: list[str] = []
-    run_results: list[tuple[str, str, str, int]] = []  # (query, display, 출발일, 가격)
+    # (경유지 키, display, 출발일, 도착일, 가격, 그 지역 예산, 그 지역 상한가)
+    run_results: list[tuple[str, str, str, str, int, int, int | None]] = []
     checked = 0
     skipped = 0
+    timed_out = False
+    started = time.monotonic()
+    max_minutes = cfg.get("max_run_minutes")
+    run_limit = max_minutes * 60 if max_minutes else None
 
     with sync_playwright() as p:
         browser = launch_browser(p)
         page = browser.new_page()
 
-        for dest in cfg["destinations"]:
-            for dep_entry in cfg["depart_dates"]:
-                dep_date = dep_entry["date"]
-                min_hour = dep_entry.get("min_departure_hour")
+        # 지역(region) 안에서만 (들어가는 공항 x 나오는 공항)을 조합한다 — 1월 초에
+        # 들어가 2주 안에 다닐 수 있는 범위라서, 우루무치로 들어갔다가 상하이에서
+        # 나오는 식의 비현실적인 조합은 애초에 안 만든다. 같은 공항으로 들고 나는
+        # 조합(대각선)도 포함된다. 자세한 건 config_io.iter_combos 참고.
+        combos = list(iter_combos(cfg))
+        # 시간 제한(max_run_minutes)에 걸려 중간에 끊기는 날에도 뒤쪽 지역이 매번
+        # 굶지 않도록, 시작 위치를 시간마다 돌려가며(로테이션) 조회한다.
+        if combos:
+            shift = int(time.time() // 3600) % len(combos)
+            combos = combos[shift:] + combos[:shift]
+        log.info(
+            "이번 실행: 공항 조합 %d개 x 날짜 %d개 = %d회 조회 예정",
+            len(combos), len(cfg["date_options"]), len(combos) * len(cfg["date_options"]),
+        )
+        for region, cin, cout in combos:
+            region_name = region["name"]
+            budget, ceiling = region_thresholds(cfg, region)
+            key = cin["code"] if cin["code"] == cout["code"] else f'{cin["code"]}-{cout["code"]}'
+            label = cin["display"] if cin["code"] == cout["code"] else f'{cin["display"]}→{cout["display"]}'
 
-                url = build_url(cfg["origin"], dest["query"], dep_date, cfg["return_date"])
-                legs = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
+            for combo in cfg["date_options"]:
+                if run_limit and time.monotonic() - started > run_limit:
+                    timed_out = True
+                    break
+                dep_date, ret_date = combo["depart"], combo["return"]
+                legs = [
+                    (dep_date, cfg["origin"], cin["code"]),
+                    (ret_date, cout["code"], cfg["final_dest"]),
+                ]
+                url = build_tfs_url(legs, TRIP_MULTI_CITY)
+                found = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
 
                 # 브라우저/페이지가 죽으면(메모리 부족 등으로 "Page crashed",
                 # "browser has been closed") 이후 모든 조회가 줄줄이 실패한다.
-                # 한 번 죽었다고 남은 목적지를 전부 날리지 않도록 되살린다.
-                if not legs and not page_alive(page):
+                # 한 번 죽었다고 남은 조합을 전부 날리지 않도록 되살린다.
+                if not found and not page_alive(page):
                     log.warning("브라우저가 죽어 재시작합니다")
                     browser, page = restart_browser(p, browser)
-                    legs = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
+                    found = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
 
-                result = pick_cheapest(legs, min_hour)
+                result = pick_cheapest(found, None)
                 checked += 1
 
                 if result is None:
                     skipped += 1
-                    reason = "결과 없음" if not legs else f"{min_hour}시 이후 출발편 없음"
-                    log.info("가격 확인 실패 — 건너뜀: %s (%s, %s)", dest["display"], dep_date, reason)
+                    log.info("가격 확인 실패 — 건너뜀: [%s] %s (%s→%s)", region_name, label, dep_date, ret_date)
                 else:
                     log.info(
-                        "%s (%s, %s 출발): ₩%s", dest["display"], dep_date, result.dep_display, f"{result.price_krw:,}"
+                        "[%s] %s (%s→%s, %s 출발): ₩%s",
+                        region_name, label, dep_date, ret_date, result.dep_display, f"{result.price_krw:,}",
                     )
                     alert = check_and_record(
-                        conn, dest["query"], dest["display"], dep_date, cfg["return_date"], result,
-                        cfg["budget_krw"], cfg.get("max_price_krw"),
+                        conn, key, label, dep_date, ret_date, result, budget, ceiling,
                     )
-                    run_results.append((dest["query"], dest["display"], dep_date, result.price_krw))
+                    run_results.append((key, label, dep_date, ret_date, result.price_krw, budget, ceiling))
                     if alert:
-                        return_leg = fetch_return_leg(page, result, cfg["render_wait_ms"])
+                        # 오는편 화면은 고정 대기라, 최대 대기(render_wait_ms)를 그대로 쓰면
+                        # 알림마다 너무 오래 걸려서 9초로 묶어둔다.
+                        return_leg = fetch_return_leg(page, result, min(cfg["render_wait_ms"], 9000))
                         if return_leg:
-                            alert += f"\n[오는편] {return_leg.dep_airport} {return_leg.dep_display} 출발 ({cfg['return_date']})"
+                            alert += f"\n[오는편] {return_leg.dep_airport} {return_leg.dep_display} 출발 ({ret_date})"
                         else:
                             alert += "\n[오는편] 시각 확인 실패 — 링크에서 직접 확인 필요"
                         alerts.append(alert)
 
                 time.sleep(cfg["request_delay_seconds"])
 
+            if timed_out:
+                break
+
         close_quietly(browser)
 
     log.info("완료: %d건 조회, %d건 실패, %d건 알림", checked, skipped, len(alerts))
+    if timed_out:
+        log.warning("시간 제한(%s분)에 걸려 %d회 조회 후 중단했습니다", max_minutes, checked)
 
     # 보낼 메시지를 먼저 모은다. 알림(가격 급락/예산 진입)은 조건부지만,
     # hourly_digest가 켜져 있으면 변동이 없어도 매 실행마다 현황을 보낸다.
     messages: list[str] = []
     if alerts:
-        header = f"✈️ 대련 출발 국경절 항공권 알림 ({len(alerts)}건)\n{'─' * 20}\n"
+        header = f"✈️ {cfg['origin']}→{cfg['final_dest']} 항공권 알림 ({len(alerts)}건)\n{'─' * 20}\n"
         messages.append(header + "\n\n".join(alerts))
     if cfg.get("hourly_digest"):
-        messages.append(build_digest(
-            conn, run_results, cfg["budget_krw"], cfg.get("digest_top_n"),
-            cfg.get("max_price_krw"),
-        ))
+        digest = build_digest(conn, run_results, cfg.get("digest_top_n"))
+        if timed_out:
+            digest += f"\n(시간 제한으로 {checked}회 조회 후 중단 — 나머지는 다음 실행에서)"
+        messages.append(digest)
 
     if messages:
         import os

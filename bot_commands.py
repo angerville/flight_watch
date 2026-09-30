@@ -1,4 +1,7 @@
-"""텔레그램 봇 대화로 flight_watch 설정(예산/날짜/목적지)을 바꾸는 커맨드 처리기.
+"""텔레그램 봇 대화로 flight_watch 설정(예산/상한가)을 바꾸고 현황을 조회하는 커맨드 처리기.
+
+날짜·경유지(오픈조 cin x cout) 조합은 구조가 복잡해져 명령어로는 안 바꾸고
+config.yaml을 직접 편집한다.
 
 track_prices.py(시간당 1회, Playwright 필요, 느림)와 분리된 가벼운 스크립트로
 10~15분마다 돌린다 — 브라우저를 안 띄우니 명령어 반응이 훨씬 빠르다.
@@ -18,7 +21,6 @@ track_prices.py(시간당 1회, Playwright 필요, 느림)와 분리된 가벼�
 from __future__ import annotations
 
 import os
-import re
 import sqlite3
 import sys
 import time
@@ -30,7 +32,15 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE
 sys.path.insert(0, str(HERE))
 
-from config_io import load_base_config, load_config, load_overrides, save_overrides  # noqa: E402
+from config_io import (  # noqa: E402
+    airport_names,
+    iter_combos,
+    load_base_config,
+    load_config,
+    load_overrides,
+    region_thresholds,
+    save_overrides,
+)
 from notify import TelegramNotifier  # noqa: E402
 from lockfile import single_instance  # noqa: E402
 
@@ -48,35 +58,6 @@ RUN_DURATION_SECONDS = 570
 
 #: getUpdates가 실패했을 때 재시도까지 쉬는 시간(초)
 ERROR_RETRY_DELAY_SECONDS = 5
-
-# 표시 이름(한글) -> Google Flights 검색어(영문). /destinations, /adddest 에서 씀.
-# 대련에서 갈 만한 중국 국내 주요 도시 위주로 넉넉히 잡음 — 목록에 없으면
-# /adddest <표시이름> <영문검색어> 로 직접 추가할 수 있다.
-CITY_CATALOG: dict[str, str] = {
-    "싼야": "Sanya", "하이커우": "Haikou", "쿤밍": "Kunming", "리장": "Lijiang",
-    "다리": "Dali", "시솽반나": "Xishuangbanna", "구이린": "Guilin",
-    "장자제": "Zhangjiajie", "구이양": "Guiyang", "청두": "Chengdu",
-    "충칭": "Chongqing", "시안": "Xian", "란저우": "Lanzhou", "우루무치": "Urumqi",
-    "라싸": "Lhasa", "시닝": "Xining", "칭다오": "Qingdao", "지난": "Jinan",
-    "상하이": "Shanghai", "항저우": "Hangzhou", "닝보": "Ningbo", "난징": "Nanjing",
-    "우시": "Wuxi", "쑤저우": "Suzhou", "허페이": "Hefei", "광저우": "Guangzhou",
-    "선전": "Shenzhen", "샤먼": "Xiamen", "푸저우": "Fuzhou", "창사": "Changsha",
-    "난창": "Nanchang", "우한": "Wuhan", "정저우": "Zhengzhou", "하얼빈": "Harbin",
-    "창춘": "Changchun", "선양": "Shenyang", "베이징": "Beijing", "톈진": "Tianjin",
-    "스자좡": "Shijiazhuang",
-    # 일본 / 대만 / 홍콩·마카오 / 동남아 (한국은 출발지 기준 여행지로 의미 없어 제외)
-    "도쿄": "Tokyo", "오사카": "Osaka", "후쿠오카": "Fukuoka", "삿포로": "Sapporo",
-    "나고야": "Nagoya", "오키나와": "Okinawa",
-    "타이베이": "Taipei", "가오슝": "Kaohsiung",
-    "홍콩": "Hong Kong", "마카오": "Macau",
-    "방콕": "Bangkok", "치앙마이": "Chiang Mai", "푸켓": "Phuket",
-    "호치민": "Ho Chi Minh City", "하노이": "Hanoi", "다낭": "Da Nang",
-    "마닐라": "Manila", "세부": "Cebu", "보라카이": "Boracay",
-    "싱가포르": "Singapore", "쿠알라룸푸르": "Kuala Lumpur",
-    "프놈펜": "Phnom Penh", "시엠립": "Siem Reap",
-    "발리": "Bali", "자카르타": "Jakarta",
-}
-
 
 def _load_state():
     token = os.environ.get("FLIGHT_TELEGRAM_BOT_TOKEN", "").strip()
@@ -129,40 +110,55 @@ def _fetch_messages(token: str, offset: int, poll_timeout: int = 0) -> tuple[lis
     return messages, next_offset
 
 
-def _fmt_dest_list(destinations: list[dict]) -> str:
-    return ", ".join(d["display"] for d in destinations)
-
-
-def _fmt_dates(cfg: dict) -> str:
-    lines = []
-    for d in cfg["depart_dates"]:
-        h = d.get("min_departure_hour")
-        constraint = f" ({h}시 이후만)" if h is not None else ""
-        lines.append(f"  {d['date']}{constraint}")
-    return "\n".join(lines) + f"\n  귀국: {cfg['return_date']}"
+def _fmt_regions(cfg: dict) -> str:
+    """켜진 지역별 공항 조합 수·예산·상한가와 매 실행 조회 수를 보여준다."""
+    per_region: dict[str, list] = {}
+    for region, _cin, _cout in iter_combos(cfg):
+        entry = per_region.setdefault(region["name"], [0, region])
+        entry[0] += 1
+    off = [r["name"] for r in cfg.get("regions", []) if not r.get("enabled", True)]
+    lines = [f"지역 {len(per_region)}곳:"]
+    for name, (n, region) in per_region.items():
+        budget, ceiling = region_thresholds(cfg, region)
+        ceil_text = f"₩{ceiling:,}" if ceiling else "없음"
+        lines.append(f"  {name} — 조합 {n}개 · 예산 ₩{budget:,} · 상한 {ceil_text}")
+    total = sum(n for n, _ in per_region.values()) * len(cfg["date_options"])
+    lines.append(f"→ 매 실행 조회 {total}회")
+    if off:
+        lines.append(f"꺼둔 지역: {', '.join(off)}")
+    return "\n".join(lines)
 
 
 def _status_text(cfg: dict) -> str:
     max_price = cfg.get("max_price_krw")
     max_price_text = f"₩{max_price:,}" if max_price else "없음"
+    combos = ", ".join(f"{d['depart']}→{d['return']}" for d in cfg["date_options"])
     return (
         "📋 현재 설정\n"
-        f"예산: ₩{cfg['budget_krw']:,}\n"
-        f"상한가: {max_price_text}\n"
-        f"날짜:\n{_fmt_dates(cfg)}\n"
-        f"목적지({len(cfg['destinations'])}개): {_fmt_dest_list(cfg['destinations'])}"
+        f"{cfg['origin']} → {cfg['final_dest']} (오픈조)\n"
+        f"기본 예산: ₩{cfg['budget_krw']:,} / 기본 상한가: {max_price_text}\n"
+        "(지역에 따로 적힌 값이 있으면 그 지역은 그 값을 씁니다)\n"
+        f"날짜 조합:\n  {combos}\n"
+        f"{_fmt_regions(cfg)}"
     )
 
 
 def _show_prices(args: list[str], overrides: dict, cfg: dict) -> str:
-    """예산 이내로 트래킹 중인 항공권을 전부 보여준다.
+    """지역별 예산 이내로 트래킹 중인 항공권을 전부 보여준다.
 
     track_prices.py가 기록한 가격 이력 DB(state/flight_prices.sqlite)에서
-    (목적지 × 출발일)별 사상 최저가와 가장 최근 조회가를 읽어, 현재 예산 이하인
-    것만 싼 순서로 나열한다. DB는 track_prices.py 소유라 여기서는 mode=ro로만
-    연다 — 두 워크플로가 같은 파일을 쓰지 않게 한 설계를 깨지 않기 위해서다.
+    (공항 조합 × 날짜 조합)별 사상 최저가와 가장 최근 조회가를 읽어, 그 조합이
+    속한 지역의 예산 이하인 것만 싼 순서로 나열한다. DB는 track_prices.py
+    소유라 여기서는 mode=ro로만 연다 — 두 워크플로가 같은 파일을 쓰지 않게 한
+    설계를 깨지 않기 위해서다.
     """
-    budget = cfg["budget_krw"]
+    # DB에 남은 키("CODE" 또는 "CIN-COUT") -> 그 조합이 속한 지역의 예산.
+    # 지금 켜져 있지 않은 조합(예전 이력, 꺼둔 지역)은 예산을 알 수 없으니 뺀다.
+    budget_by_key: dict[str, int] = {}
+    for region, cin, cout in iter_combos(cfg):
+        key = cin["code"] if cin["code"] == cout["code"] else f'{cin["code"]}-{cout["code"]}'
+        budget_by_key[key] = region_thresholds(cfg, region)[0]
+
     db_path = HERE / cfg["state_db"]
     try:
         conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
@@ -170,37 +166,44 @@ def _show_prices(args: list[str], overrides: dict, cfg: dict) -> str:
         return "아직 가격 이력이 없습니다. track_prices 첫 조회가 끝나면 다시 시도하세요."
 
     try:
-        rows = conn.execute(
-            "SELECT destination, depart_date, best_price_krw "
-            "FROM best WHERE best_price_krw <= ? ORDER BY best_price_krw",
-            (budget,),
+        all_rows = conn.execute(
+            "SELECT destination, depart_date, return_date, best_price_krw "
+            "FROM best ORDER BY best_price_krw"
         ).fetchall()
     except sqlite3.OperationalError:
         conn.close()
         return "아직 가격 이력이 없습니다. track_prices 첫 조회가 끝나면 다시 시도하세요."
 
+    rows = [r for r in all_rows if r[0] in budget_by_key and r[3] <= budget_by_key[r[0]]]
     if not rows:
         conn.close()
         return (
-            f"💰 예산 ₩{budget:,} 이내 항공권: 아직 없음\n"
+            "💰 지역별 예산 이내 항공권: 아직 없음\n"
             "다음 조회에서 예산 이하가 나오면 알림이 갑니다."
         )
 
-    q2disp = {d["query"]: d["display"] for d in cfg["destinations"]}
-    lines = [f"💰 예산 ₩{budget:,} 이내 항공권 ({len(rows)}건)", "─" * 20]
-    for dest, dep, best_price in rows:
-        disp = q2disp.get(dest, dest)
+    code2disp = airport_names(cfg)
+
+    def label(dest_key: str) -> str:
+        # track_prices.py가 만드는 키 그대로: 같은 공항이면 "CODE", 다르면
+        # "CIN-COUT". 표시 이름으로 되돌린다.
+        parts = dest_key.split("-")
+        names = [code2disp.get(p, p) for p in parts]
+        return names[0] if len(names) == 1 else f"{names[0]}→{names[1]}"
+
+    lines = [f"💰 지역별 예산 이내 항공권 ({len(rows)}건)", "─" * 20]
+    for dest, dep, ret, best_price in rows:
         latest = conn.execute(
             "SELECT price_krw, checked_at FROM checks "
-            "WHERE destination=? AND depart_date=? ORDER BY checked_at DESC LIMIT 1",
-            (dest, dep),
+            "WHERE destination=? AND depart_date=? AND return_date=? ORDER BY checked_at DESC LIMIT 1",
+            (dest, dep, ret),
         ).fetchone()
         if latest and latest[0] != best_price:
             day = latest[1][5:10].replace("-", "/")
             tail = f" · 최근 ₩{latest[0]:,} ({day})"
         else:
             tail = ""
-        lines.append(f"{disp} {dep[5:]} · 최저 ₩{best_price:,}{tail}")
+        lines.append(f"{label(dest)} {dep[5:]}→{ret[5:]} · 최저 ₩{best_price:,}{tail}")
     conn.close()
     lines.append("")
     lines.append("가격 = 트래킹 이래 최저가. 항공편 상세는 알림 메시지에서 확인.")
@@ -210,14 +213,13 @@ def _show_prices(args: list[str], overrides: dict, cfg: dict) -> str:
 HELP_TEXT = (
     "✈️ flight_watch 명령어\n"
     "/status — 현재 설정 보기\n"
-    "/price — 예산 이내로 트래킹 중인 항공권 전부 보기\n"
-    "/budget 400000 — 예산(원) 변경\n"
-    "/maxprice 800000 — 관심 상한가(원). 초과 목적지는 현황에서 뺌 (none이면 해제)\n"
-    "/dates 2026-09-30 2026-10-01 2026-10-07 — 출발일(들) + 마지막 값은 귀국일\n"
-    "/minhour 2026-09-30 17 — 그 출발일은 17시 이후 항공편만 (0 또는 none이면 해제)\n"
-    "/destinations 상하이 시안 칭다오 — 목적지 목록 전체 교체 (카탈로그에 있는 이름만)\n"
-    "/adddest 하얼빈 Harbin — 카탈로그에 없는 도시를 표시이름+영문검색어로 추가\n"
-    "/help — 이 메시지"
+    "/price — 지역별 예산 이내로 트래킹 중인 항공권 전부 보기\n"
+    "/budget 800000 — 기본 예산(원) 변경 (지역에 따로 적힌 예산은 그대로)\n"
+    "/maxprice 1500000 — 기본 상한가(원). 초과 조합은 현황에서 뺌 (none이면 해제)\n"
+    "/help — 이 메시지\n"
+    "\n"
+    "날짜·경유지 후보 변경은 config.yaml을 직접 편집하세요 — 오픈조(cin x cout)"
+    " 조합이라 텔레그램 명령어로 안전하게 바꾸기엔 구조가 복잡해졌습니다."
 )
 
 
@@ -248,81 +250,9 @@ def _apply_maxprice(args: list[str], overrides: dict, cfg: dict) -> str:
     )
 
 
-def _apply_dates(args: list[str], overrides: dict, cfg: dict) -> str:
-    if len(args) < 2:
-        return "사용법: /dates 2026-09-30 2026-10-01 2026-10-07 (마지막이 귀국일)"
-    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-    if not all(date_re.match(a) for a in args):
-        return "날짜는 YYYY-MM-DD 형식이어야 합니다."
-
-    *depart_dates, return_date = args
-    existing = {d["date"]: d.get("min_departure_hour") for d in cfg["depart_dates"]}
-    overrides["depart_dates"] = [
-        {"date": d, "min_departure_hour": existing.get(d)} for d in depart_dates
-    ]
-    overrides["return_date"] = return_date
-    return f"✅ 출발일 {', '.join(depart_dates)} / 귀국일 {return_date}로 변경했습니다."
-
-
-def _apply_minhour(args: list[str], overrides: dict, cfg: dict) -> str:
-    if len(args) != 2:
-        return "사용법: /minhour 2026-09-30 17  (해제하려면 /minhour 2026-09-30 none)"
-    date, hour_text = args
-    depart_dates = overrides.get("depart_dates", cfg["depart_dates"])
-    depart_dates = [dict(d) for d in depart_dates]
-    match = next((d for d in depart_dates if d["date"] == date), None)
-    if match is None:
-        dates = ", ".join(d["date"] for d in depart_dates)
-        return f"{date}는 현재 출발일 목록에 없습니다. 현재 출발일: {dates}"
-
-    if hour_text.lower() in ("none", "0", "해제"):
-        match["min_departure_hour"] = None
-        overrides["depart_dates"] = depart_dates
-        return f"✅ {date} 출발시각 제약을 해제했습니다."
-
-    if not hour_text.isdigit() or not (0 <= int(hour_text) <= 23):
-        return "시각은 0~23 사이 숫자거나 none 이어야 합니다."
-
-    match["min_departure_hour"] = int(hour_text)
-    overrides["depart_dates"] = depart_dates
-    return f"✅ {date}는 이제 {hour_text}시 이후 출발편만 찾습니다."
-
-
-def _apply_destinations(args: list[str], overrides: dict, cfg: dict) -> str:
-    if not args:
-        return "사용법: /destinations 상하이 시안 칭다오 (공백 또는 쉼표로 구분)"
-    names = [n.strip() for n in " ".join(args).replace(",", " ").split() if n.strip()]
-    unknown = [n for n in names if n not in CITY_CATALOG]
-    if unknown:
-        return (
-            f"카탈로그에 없는 도시: {', '.join(unknown)}\n"
-            "먼저 /adddest <표시이름> <영문검색어> 로 추가하거나, 철자를 확인하세요."
-        )
-
-    custom = {d["display"]: d for d in load_overrides().get("destinations", []) if d["display"] not in CITY_CATALOG}
-    overrides["destinations"] = [{"query": CITY_CATALOG[n], "display": n} for n in names]
-    return f"✅ 목적지를 {len(names)}개로 교체했습니다: {', '.join(names)}"
-
-
-def _apply_adddest(args: list[str], overrides: dict, cfg: dict) -> str:
-    if len(args) != 2:
-        return "사용법: /adddest 하얼빈 Harbin"
-    display, query = args
-    current = overrides.get("destinations", cfg["destinations"])
-    current = [d for d in current if d["display"] != display]
-    current.append({"query": query, "display": display})
-    overrides["destinations"] = current
-    CITY_CATALOG[display] = query  # 이번 실행 중에는 /destinations 에서도 바로 인식되게
-    return f"✅ 목적지 '{display}'({query})를 추가했습니다. 총 {len(current)}개."
-
-
 COMMANDS = {
     "budget": _apply_budget,
     "maxprice": _apply_maxprice,
-    "dates": _apply_dates,
-    "minhour": _apply_minhour,
-    "destinations": _apply_destinations,
-    "adddest": _apply_adddest,
 }
 
 
