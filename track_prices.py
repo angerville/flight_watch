@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import re
 import sqlite3
 import statistics
@@ -728,6 +729,7 @@ def _run() -> None:
     checked = 0
     skipped = 0
     timed_out = False
+    regions_skipped = False
     started = time.monotonic()
     max_minutes = cfg.get("max_run_minutes")
     run_limit = max_minutes * 60 if max_minutes else None
@@ -752,6 +754,18 @@ def _run() -> None:
         # 나오는 식의 비현실적인 조합은 애초에 안 만든다. 같은 공항으로 들고 나는
         # 조합(대각선)도 포함된다. 자세한 건 config_io.iter_combos 참고.
         combos = list(iter_combos(cfg))
+        # 클라우드(GitHub Actions)는 비공개 저장소 무료 사용량(월 2,000분)이 빠듯해서,
+        # 지역 조회(1회 20분 남짓)는 UTC 0시·12시 슬롯 실행에서만 한다. 6시·18시 슬롯은
+        # 지정 항공편만 보고 끝낸다. cron이 30분~1시간씩 늦게 도는 걸 감안해 6시간
+        # 단위 슬롯으로 판정한다. PC 실행은 해당 없음.
+        if (
+            os.environ.get("GITHUB_ACTIONS") == "true"
+            and cfg.get("cloud_regions_every_12h", True)
+            and (time.gmtime().tm_hour // 6) % 2 == 1
+        ):
+            log.info("클라우드 6시·18시(UTC) 슬롯 — 지역 조회 생략, 지정 항공편만 조회")
+            combos = []
+            regions_skipped = True
         # 시간 제한(max_run_minutes)에 걸려 중간에 끊기는 날에도 뒤쪽 지역이 매번
         # 굶지 않도록, 시작 위치를 시간마다 돌려가며(로테이션) 조회한다.
         if combos:
@@ -830,7 +844,11 @@ def _run() -> None:
         header = f"✈️ {cfg['origin']}→{cfg['final_dest']} 항공권 알림 ({len(alerts)}건)\n{'─' * 20}\n"
         messages.append(header + "\n\n".join(alerts))
     if cfg.get("hourly_digest"):
-        digest = build_digest(conn, run_results, cfg.get("digest_top_n"))
+        if regions_skipped:
+            # 지역 조회를 안 한 실행은 "가격을 못 가져왔다"가 아니라 지정 항공편만 보낸다.
+            digest = f"✈️ 지정 항공편 현황 ({time.strftime('%m/%d %H:%M')}) — 1월 여정은 12시간마다 조회"
+        else:
+            digest = build_digest(conn, run_results, cfg.get("digest_top_n"))
         if wt_lines:
             digest += "\n" + "\n".join(wt_lines)
         if timed_out:
@@ -838,8 +856,6 @@ def _run() -> None:
         messages.append(digest)
 
     if messages:
-        import os
-
         # 공모전 파이프라인(contest_auto)이 쓰는 TELEGRAM_BOT_TOKEN과는 별도로,
         # 이 트래커 전용 봇(FLIGHT_TELEGRAM_BOT_TOKEN)을 쓴다 — 알림이 섞이지
         # 않게 하려고 일부러 분리함.
