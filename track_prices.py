@@ -397,7 +397,7 @@ def _display_to_hhmm(display: str) -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
-def _pick_legs(legs: list[FlightLeg], spec: dict) -> list[tuple[str, FlightLeg | None]]:
+def _pick_legs(legs: list[FlightLeg], spec: dict, direct_only: bool = False) -> list[tuple[str, FlightLeg | None]]:
     """구간 설정(airline, depart)에 맞는 편을 (표시 라벨, 편) 목록으로 고른다.
 
     depart가 "all"이면 검색 결과에 나온 편 전부(같은 항공사·시각은 최저가 하나만,
@@ -406,7 +406,13 @@ def _pick_legs(legs: list[FlightLeg], spec: dict) -> list[tuple[str, FlightLeg |
     """
     airline = spec.get("airline")
     depart = spec.get("depart", "all")
-    legs = [l for l in legs if not airline or airline in l.airline]
+    after = spec.get("after")  # "HH:MM" — 이 시각 이후(포함) 출발편만
+    legs = [
+        l for l in legs
+        if (not airline or airline in l.airline)
+        and (not direct_only or l.stops == "직항")
+        and (not after or _display_to_hhmm(l.dep_display) >= after)
+    ]
     if depart == "all":
         cheapest: dict[tuple[str, str], FlightLeg] = {}
         for l in legs:
@@ -435,9 +441,10 @@ def _price_delta(price: int, prev_price: int | None) -> str:
 def check_watch_trips(page, conn, cfg) -> tuple[list[str], list[str]]:
     """config의 watch_trips(항공사·시각까지 정해진 특정 편)를 조회한다.
 
-    - return이 있으면 왕복: 지정한 가는편 카드를 찾아 클릭한 뒤, 오는편 화면에서
-      지정 시각(또는 "all"이면 전부)의 편마다 왕복 총액을 읽는다. 오는편 카드의
-      가격은 "이 가는편 + 이 오는편" 왕복 총액이라 오는편마다 별도 항목(키)이다.
+    - return이 있으면 왕복: 지정한 가는편(또는 "all"이면 가는편마다) 카드를 클릭한
+      뒤, 오는편 화면에서 지정 시각(또는 전부)의 편마다 왕복 총액을 읽는다. 오는편
+      카드의 가격은 "이 가는편 + 이 오는편" 왕복 총액이라 조합마다 별도 항목(키)이다.
+    - direct_only: true면 가는편·오는편 모두 직항만 본다.
     - return이 없으면 편도: outbound에 맞는 편마다 편도 가격을 기록한다.
     가는편 날짜가 지난 여정은 건너뛴다.
 
@@ -471,11 +478,12 @@ def check_watch_trips(page, conn, cfg) -> tuple[list[str], list[str]]:
         # 예산을 null로 두면 💰 예산 알림 없이 📉/🎯(하락) 알림만 받는다.
         budget = trip.get("budget_krw") or 0
         ceiling = trip.get("max_price_krw")
+        direct = bool(trip.get("direct_only"))
 
         if rt is None:
             url = build_tfs_url([(dep_date, ob["from"], ob["to"])], TRIP_ONE_WAY)
             found = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
-            for label, leg in _pick_legs(found, ob) or [("", None)]:
+            for label, leg in _pick_legs(found, ob, direct) or [("", None)]:
                 line_head = f"{name} {dep_date[5:]} {label}".rstrip()
                 if leg is None:
                     why = "검색 결과에 없음" if found else "조회 실패"
@@ -491,40 +499,59 @@ def check_watch_trips(page, conn, cfg) -> tuple[list[str], list[str]]:
         ret_date = rt["date"]
         url = build_tfs_url([(dep_date, ob["from"], ob["to"]), (ret_date, rt["from"], rt["to"])], TRIP_ROUND)
         found = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
-        ob_label, outbound = _pick_legs(found, ob)[0]
-        head = f"{name} {dep_date[5:]} {ob['depart']}"
-        if outbound is None:
+        outbounds = _pick_legs(found, ob, direct)
+        if not outbounds or all(leg is None for _, leg in outbounds):
+            head = f"{name} {dep_date[5:]} {ob.get('depart', 'all')}"
             why = "가는편이 검색 결과에 없음" if found else "조회 실패"
             log.info("지정 항공편 건너뜀 (%s): %s", why, head)
             digest_lines.append(f"  {head}: {why}")
             continue
 
-        # 가는편을 고르면 같은 페이지가 오는편 목록으로 바뀐다. 오는편(출발공항이
-        # 가는편과 다른 카드)이 뜰 때까지 기다린다.
-        returns: list[FlightLeg] = []
-        try:
-            page.locator(f'[aria-label="{outbound.raw_label}"]').first.click(force=True, timeout=10000)
-            deadline = time.monotonic() + cfg["render_wait_ms"] / 1000
-            while time.monotonic() < deadline and not returns:
-                page.wait_for_timeout(1000)
-                returns = [l for l in _extract_legs(page) if l.dep_airport != outbound.dep_airport]
-            if returns:
-                page.wait_for_timeout(1500)
-                returns = [l for l in _extract_legs(page) if l.dep_airport != outbound.dep_airport]
-        except Exception as exc:  # noqa: BLE001
-            log.warning("지정 항공편 가는편 클릭 실패: %s (%s)", head, exc)
-
-        for ret_label, ret_leg in _pick_legs(returns, rt) or [("", None)]:
-            line_head = f"{head} / {ret_date[5:]} {ret_label}".rstrip()
-            if ret_leg is None:
-                why = "오는편이 검색 결과에 없음" if returns else "오는편 조회 실패"
-                log.info("지정 항공편 건너뜀 (%s): %s", why, line_head)
-                digest_lines.append(f"  {line_head}: {why}")
+        for i, (ob_label, outbound) in enumerate(outbounds):
+            head = f"{name} {dep_date[5:]} {ob_label}"
+            if outbound is None:
+                log.info("지정 항공편 건너뜀 (가는편이 검색 결과에 없음): %s", head)
+                digest_lines.append(f"  {head}: 가는편이 검색 결과에 없음")
                 continue
-            # 왕복 총액은 오는편 카드 쪽 값이고, 나머지 표시 정보는 가는편 기준으로 남긴다.
-            record(name, f"WT:{name}|{ob_label}|{ret_label}", line_head, dep_date, ret_date, outbound,
-                   ret_leg.price_krw, budget, ceiling,
-                   f"\n[오는편] {ret_leg.dep_airport} {ret_leg.dep_display} 출발 · {ret_leg.airline} ({ret_date})")
+            # 가는편을 하나 고르면 페이지가 그 편의 오는편 목록으로 바뀌므로, 두 번째
+            # 가는편부터는 검색 결과를 다시 불러와 같은 편(항공사·시각) 카드를 찾는다.
+            if i > 0:
+                time.sleep(cfg["request_delay_seconds"])
+                reloaded = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
+                outbound = next(
+                    (l for l in reloaded if l.airline == outbound.airline and l.dep_display == outbound.dep_display),
+                    None,
+                )
+                if outbound is None:
+                    log.info("지정 항공편 건너뜀 (다시 불러온 결과에 가는편 없음): %s", head)
+                    digest_lines.append(f"  {head}: 조회 실패")
+                    continue
+
+            # 오는편(출발공항이 가는편과 다른 카드)이 뜰 때까지 기다린다.
+            returns: list[FlightLeg] = []
+            try:
+                page.locator(f'[aria-label="{outbound.raw_label}"]').first.click(force=True, timeout=10000)
+                deadline = time.monotonic() + cfg["render_wait_ms"] / 1000
+                while time.monotonic() < deadline and not returns:
+                    page.wait_for_timeout(1000)
+                    returns = [l for l in _extract_legs(page) if l.dep_airport != outbound.dep_airport]
+                if returns:
+                    page.wait_for_timeout(1500)
+                    returns = [l for l in _extract_legs(page) if l.dep_airport != outbound.dep_airport]
+            except Exception as exc:  # noqa: BLE001
+                log.warning("지정 항공편 가는편 클릭 실패: %s (%s)", head, exc)
+
+            for ret_label, ret_leg in _pick_legs(returns, rt, direct) or [("", None)]:
+                line_head = f"{head} / {ret_date[5:]} {ret_label}".rstrip()
+                if ret_leg is None:
+                    why = "오는편이 검색 결과에 없음" if returns else "오는편 조회 실패"
+                    log.info("지정 항공편 건너뜀 (%s): %s", why, line_head)
+                    digest_lines.append(f"  {line_head}: {why}")
+                    continue
+                # 왕복 총액은 오는편 카드 쪽 값이고, 나머지 표시 정보는 가는편 기준으로 남긴다.
+                record(name, f"WT:{name}|{ob_label}|{ret_label}", line_head, dep_date, ret_date, outbound,
+                       ret_leg.price_krw, budget, ceiling,
+                       f"\n[오는편] {ret_leg.dep_airport} {ret_leg.dep_display} 출발 · {ret_leg.airline} ({ret_date})")
 
         time.sleep(cfg["request_delay_seconds"])
 
