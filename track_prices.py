@@ -194,6 +194,7 @@ def init_db(path: Path) -> sqlite3.Connection:
 #: 오픈조/다구간 tfs 인코딩용 트립 타입. 딱 왕복(같은 도시로 들고 남)이면
 #: TRIP_ROUND, 들어가는 곳과 나오는 곳이 다르면 TRIP_MULTI_CITY.
 TRIP_ROUND = 1
+TRIP_ONE_WAY = 2
 TRIP_MULTI_CITY = 3
 
 
@@ -236,10 +237,10 @@ def build_tfs_url(legs: list[tuple[str, str, str]], trip: int) -> str:
     return f"https://www.google.com/travel/flights?tfs={tfs}&hl=ko&gl=KR&curr=KRW"
 
 
-# 항공편 카드의 aria-label 파싱. "왕복 총 가격은 최저 ..." 형태이고, 가격은
-# 여정 전체 총액, 카드에 적힌 시각은 가는편의 것이다.
+# 항공편 카드의 aria-label 파싱. 왕복/다구간은 "왕복 총 가격은 최저 ...", 편도는
+# "최저가는 ..." 형태다. 가격은 여정 전체 총액, 카드에 적힌 시각은 가는편의 것이다.
 _LEG_RE = re.compile(
-    r"(?:왕복\s*)?총 가격은 최저\s*(?P<price>\d+)\s*대한민국 원입니다\.\s*"
+    r"(?:(?:왕복\s*)?총 가격은 최저|최저가는)\s*(?P<price>\d+)\s*대한민국 원입니다\.\s*"
     r"(?P<airline>.+?)의\s*(?P<stops>직항|\d+회\s*경유)\s*항공편입니다\.\s*"
     r"\S+요일,\s*\d+월\s*\d+\s*(?P<dep_period>오전|오후)\s*(?P<dep_time>\d{1,2}:\d{2})에\s*"
     r"(?P<dep_airport>.+?)에서\s*출발하여\s*"
@@ -268,7 +269,7 @@ def _extract_legs(page) -> list[FlightLeg]:
         """
         () => Array.from(document.querySelectorAll('[aria-label]'))
             .map(e => e.getAttribute('aria-label'))
-            .filter(l => l && l.includes('총 가격은 최저'))
+            .filter(l => l && (l.includes('총 가격은 최저') || l.startsWith('최저가는')))
         """
     )
     legs: list[FlightLeg] = []
@@ -385,16 +386,59 @@ def _hhmm_to_display(hhmm: str) -> str:
     return f"{period} {hour12}:{minute:02d}"
 
 
-def _leg_matches(leg: FlightLeg, airline: str | None, depart: str) -> bool:
-    return (not airline or airline in leg.airline) and leg.dep_display == _hhmm_to_display(depart)
+def _display_to_hhmm(display: str) -> str:
+    """"오후 7:10" -> "19:10"."""
+    period, hm = display.split()
+    hour, minute = (int(x) for x in hm.split(":"))
+    if period == "오후" and hour != 12:
+        hour += 12
+    if period == "오전" and hour == 12:
+        hour = 0
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _pick_legs(legs: list[FlightLeg], spec: dict) -> list[tuple[str, FlightLeg | None]]:
+    """구간 설정(airline, depart)에 맞는 편을 (표시 라벨, 편) 목록으로 고른다.
+
+    depart가 "all"이면 검색 결과에 나온 편 전부(같은 항공사·시각은 최저가 하나만,
+    출발시각순)를 "항공사 HH:MM" 라벨로 돌려준다. 시각(들)을 적었으면 그 순서대로
+    "HH:MM" 라벨과 맞는 편(없으면 None)을 돌려준다.
+    """
+    airline = spec.get("airline")
+    depart = spec.get("depart", "all")
+    legs = [l for l in legs if not airline or airline in l.airline]
+    if depart == "all":
+        cheapest: dict[tuple[str, str], FlightLeg] = {}
+        for l in legs:
+            k = (l.airline, l.dep_display)
+            if k not in cheapest or l.price_krw < cheapest[k].price_krw:
+                cheapest[k] = l
+        picked = sorted(cheapest.values(), key=lambda l: _display_to_hhmm(l.dep_display))
+        return [(f"{l.airline} {_display_to_hhmm(l.dep_display)}", l) for l in picked]
+    times = depart if isinstance(depart, list) else [depart]
+    return [
+        (t, min((l for l in legs if l.dep_display == _hhmm_to_display(t)), key=lambda l: l.price_krw, default=None))
+        for t in times
+    ]
+
+
+def _price_delta(price: int, prev_price: int | None) -> str:
+    if prev_price is None:
+        return " (신규)"
+    if price > prev_price:
+        return f" ▲{price - prev_price:,}"
+    if price < prev_price:
+        return f" ▼{prev_price - price:,}"
+    return " ="
 
 
 def check_watch_trips(page, conn, cfg) -> tuple[list[str], list[str]]:
-    """config의 watch_trips(항공사·시각까지 정해진 특정 왕복편)를 조회한다.
+    """config의 watch_trips(항공사·시각까지 정해진 특정 편)를 조회한다.
 
-    왕복 검색 결과에서 지정한 가는편 카드를 찾아 클릭한 뒤, 오는편 화면에서
-    지정 시각의 편마다 왕복 총액을 읽는다. 오는편 카드의 가격은 "이 가는편 +
-    이 오는편" 왕복 총액이라, 오는편 시각마다 별도 항목(키)으로 기록한다.
+    - return이 있으면 왕복: 지정한 가는편 카드를 찾아 클릭한 뒤, 오는편 화면에서
+      지정 시각(또는 "all"이면 전부)의 편마다 왕복 총액을 읽는다. 오는편 카드의
+      가격은 "이 가는편 + 이 오는편" 왕복 총액이라 오는편마다 별도 항목(키)이다.
+    - return이 없으면 편도: outbound에 맞는 편마다 편도 가격을 기록한다.
     가는편 날짜가 지난 여정은 건너뛴다.
 
     돌려주는 값: (알림 메시지 목록, 현황 요약에 붙일 줄 목록)
@@ -406,17 +450,49 @@ def check_watch_trips(page, conn, cfg) -> tuple[list[str], list[str]]:
     alert_msgs: list[str] = []
     digest_lines: list[str] = ["", "🎫 지정 항공편"]
 
-    for trip in trips:
-        name, ob, rt = trip["name"], trip["outbound"], trip["return"]
-        dep_date, ret_date = ob["date"], rt["date"]
-        ret_times = rt["depart"] if isinstance(rt["depart"], list) else [rt["depart"]]
-        budget = trip.get("budget_krw", cfg["budget_krw"])
-        ceiling = trip.get("max_price_krw")
-        head = f"{name} {dep_date[5:]} {ob['depart']}"
+    def record(name, key, line_head, dep_date, ret_date, leg, price, budget, ceiling, extra):
+        prev = conn.execute(
+            "SELECT price_krw FROM checks WHERE destination=? AND depart_date=? AND return_date=? "
+            "ORDER BY id DESC LIMIT 1",
+            (key, dep_date, ret_date),
+        ).fetchone()
+        log.info("지정 항공편 %s: ₩%s", line_head, f"{price:,}")
+        alert = check_and_record(
+            conn, key, name, dep_date, ret_date, FlightLeg(**{**leg.__dict__, "price_krw": price}), budget, ceiling,
+        )
+        if alert:
+            alert_msgs.append(alert + extra)
+        mark = "💰" if budget and price <= budget else "·"
+        digest_lines.append(f"{mark} {line_head} ₩{price:,}{_price_delta(price, prev[0] if prev else None)}")
 
+    for trip in trips:
+        name, ob, rt = trip["name"], trip["outbound"], trip.get("return")
+        dep_date = ob["date"]
+        # 예산을 null로 두면 💰 예산 알림 없이 📉/🎯(하락) 알림만 받는다.
+        budget = trip.get("budget_krw") or 0
+        ceiling = trip.get("max_price_krw")
+
+        if rt is None:
+            url = build_tfs_url([(dep_date, ob["from"], ob["to"])], TRIP_ONE_WAY)
+            found = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
+            for label, leg in _pick_legs(found, ob) or [("", None)]:
+                line_head = f"{name} {dep_date[5:]} {label}".rstrip()
+                if leg is None:
+                    why = "검색 결과에 없음" if found else "조회 실패"
+                    log.info("지정 항공편 건너뜀 (%s): %s", why, line_head)
+                    digest_lines.append(f"  {line_head}: {why}")
+                    continue
+                # 편도는 return_date 자리에 출발일을 그대로 넣는다(컬럼이 NOT NULL).
+                record(name, f"WT:{name}|{label}", line_head, dep_date, dep_date, leg, leg.price_krw,
+                       budget, ceiling, f"\n[편도] {leg.dep_airport} {leg.dep_display} 출발 · {leg.airline}")
+            time.sleep(cfg["request_delay_seconds"])
+            continue
+
+        ret_date = rt["date"]
         url = build_tfs_url([(dep_date, ob["from"], ob["to"]), (ret_date, rt["from"], rt["to"])], TRIP_ROUND)
         found = fetch_outbound_legs(page, url, cfg["render_wait_ms"])
-        outbound = next((f for f in found if _leg_matches(f, ob.get("airline"), ob["depart"])), None)
+        ob_label, outbound = _pick_legs(found, ob)[0]
+        head = f"{name} {dep_date[5:]} {ob['depart']}"
         if outbound is None:
             why = "가는편이 검색 결과에 없음" if found else "조회 실패"
             log.info("지정 항공편 건너뜀 (%s): %s", why, head)
@@ -438,41 +514,17 @@ def check_watch_trips(page, conn, cfg) -> tuple[list[str], list[str]]:
         except Exception as exc:  # noqa: BLE001
             log.warning("지정 항공편 가는편 클릭 실패: %s (%s)", head, exc)
 
-        for ret_time in ret_times:
-            line_head = f"{head} / {ret_date[5:]} {ret_time}"
-            ret_leg = next((l for l in returns if _leg_matches(l, rt.get("airline"), ret_time)), None)
+        for ret_label, ret_leg in _pick_legs(returns, rt) or [("", None)]:
+            line_head = f"{head} / {ret_date[5:]} {ret_label}".rstrip()
             if ret_leg is None:
                 why = "오는편이 검색 결과에 없음" if returns else "오는편 조회 실패"
                 log.info("지정 항공편 건너뜀 (%s): %s", why, line_head)
                 digest_lines.append(f"  {line_head}: {why}")
                 continue
-
-            key = f"WT:{name}|{ob['depart']}|{ret_time}"
-            prev = conn.execute(
-                "SELECT price_krw FROM checks WHERE destination=? AND depart_date=? AND return_date=? "
-                "ORDER BY id DESC LIMIT 1",
-                (key, dep_date, ret_date),
-            ).fetchone()
-            prev_price = prev[0] if prev else None
-
             # 왕복 총액은 오는편 카드 쪽 값이고, 나머지 표시 정보는 가는편 기준으로 남긴다.
-            record = FlightLeg(**{**outbound.__dict__, "price_krw": ret_leg.price_krw})
-            log.info("지정 항공편 %s: ₩%s", line_head, f"{ret_leg.price_krw:,}")
-            alert = check_and_record(conn, key, name, dep_date, ret_date, record, budget, ceiling)
-            if alert:
-                alert_msgs.append(f"{alert}\n[오는편] {ret_leg.dep_airport} {ret_leg.dep_display} 출발 · {ret_leg.airline} ({ret_date})")
-
-            price = ret_leg.price_krw
-            if prev_price is None:
-                delta = " (신규)"
-            elif price > prev_price:
-                delta = f" ▲{price - prev_price:,}"
-            elif price < prev_price:
-                delta = f" ▼{prev_price - price:,}"
-            else:
-                delta = " ="
-            mark = "💰" if price <= budget else "·"
-            digest_lines.append(f"{mark} {line_head} ₩{price:,}{delta}")
+            record(name, f"WT:{name}|{ob_label}|{ret_label}", line_head, dep_date, ret_date, outbound,
+                   ret_leg.price_krw, budget, ceiling,
+                   f"\n[오는편] {ret_leg.dep_airport} {ret_leg.dep_display} 출발 · {ret_leg.airline} ({ret_date})")
 
         time.sleep(cfg["request_delay_seconds"])
 
