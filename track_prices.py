@@ -845,6 +845,14 @@ def _run() -> None:
             log.info("클라우드 6시·18시(UTC) 슬롯 — 지역 조회 생략, 지정 항공편만 조회")
             combos = []
             regions_skipped = True
+        # 클라우드는 공항 조합을 N묶음으로 나눠 실행마다 한 묶음씩 번갈아 조회한다.
+        # 실행 한 번의 조회량이 전체의 1/N이 되고, 같은 조합은 N번째 실행마다 돈다.
+        # 실행 시각(12시간 슬롯)을 기준으로 묶음을 고르므로 PC 실행에는 영향이 없다.
+        if combos and os.environ.get("GITHUB_ACTIONS") == "true":
+            groups = cfg.get("cloud_region_groups", 3)
+            group = int(time.time() // (12 * 3600)) % groups
+            combos = [c for i, c in enumerate(combos) if i % groups == group]
+            log.info("클라우드 조회 묶음 %d/%d", group + 1, groups)
         # 시간 제한(max_run_minutes)에 걸려 중간에 끊기는 날에도 뒤쪽 지역이 매번
         # 굶지 않도록, 시작 위치를 시간마다 돌려가며(로테이션) 조회한다.
         if combos:
